@@ -1,0 +1,828 @@
+<!doctype html>
+<html lang="pl">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Clip to Text Pro</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@500;600&family=Manrope:wght@400;500;600;700;800&family=Sora:wght@500;600;700;800&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="hero reveal">
+        <div class="hero-top">
+          <div>
+            <p class="eyebrow">Clip to Text Pro</p>
+            <h1>Transkrypcje wideo gotowe do użycia</h1>
+          </div>
+          <div class="hero-actions">
+            <button id="theme-toggle" class="ghost-btn" type="button" aria-label="Przełącz motyw">
+              Tryb ciemny
+            </button>
+          </div>
+        </div>
+
+        <p class="hero-copy">
+          Wrzuć plik, wybierz język i tryb, a resztę zrobi lokalny silnik. Aplikacja pokazuje postęp na żywo,
+          przechowuje historię zadań i pozwala pobrać gotowy tekst jako `.txt`.
+        </p>
+
+        <ul class="hero-points">
+          <li>Upload `.mp4`, `.mov`, `.mkv`</li>
+          <li>Status w czasie rzeczywistym (SSE + fallback)</li>
+          <li>Cache wyników i trwała historia jobów</li>
+        </ul>
+      </header>
+
+      <section class="workspace">
+        <article class="panel panel-input reveal">
+          <h2>Nowe zadanie</h2>
+
+          <form id="transcribe-form" novalidate>
+            <input
+              id="video"
+              name="file"
+              type="file"
+              class="sr-only"
+              accept=".mp4,.mov,.mkv,video/mp4,video/quicktime,video/x-matroska"
+              required
+            />
+            <label id="drop-zone" class="file-drop" for="video" tabindex="0">
+              <span class="drop-overline">Plik wideo</span>
+              <strong>Przeciągnij tutaj lub kliknij, aby wybrać</strong>
+              <span id="file-name" class="file-name">Brak pliku</span>
+            </label>
+            <small class="hint">Maksymalny rozmiar: {{ max_upload_mb }} MB</small>
+
+            <label class="field" for="language">
+              <span>Język nagrania</span>
+              <select id="language" name="language">
+                <option value="pl" selected>Polski</option>
+                <option value="en">English</option>
+              </select>
+            </label>
+
+            <fieldset class="mode-toggle">
+              <legend>Tryb transkrypcji</legend>
+
+              <label class="mode-option">
+                <input type="radio" name="mode" value="fast" checked />
+                <span class="mode-content">
+                  <span class="mode-title">Szybsza</span>
+                  <span class="mode-desc">Niższy koszt i krótszy czas oczekiwania</span>
+                </span>
+              </label>
+
+              <label class="mode-option">
+                <input type="radio" name="mode" value="accurate" />
+                <span class="mode-content">
+                  <span class="mode-title">Dokładniejsza</span>
+                  <span class="mode-desc">Lepsza jakość kosztem dłuższego przetwarzania</span>
+                </span>
+              </label>
+            </fieldset>
+
+            <div class="action-row">
+              <button id="submit-btn" class="btn-primary" type="submit">Transkrybuj</button>
+              <button id="cancel-btn" class="btn-danger" type="button" hidden>Anuluj</button>
+            </div>
+          </form>
+
+          <p id="status" class="status" aria-live="polite"></p>
+
+          <section id="progress-box" class="progress-box" hidden>
+            <div class="progress-head">
+              <span id="progress-label">Oczekiwanie...</span>
+              <span id="progress-value">0%</span>
+            </div>
+            <div class="progress-track" aria-hidden="true">
+              <div id="progress-fill" class="progress-fill"></div>
+            </div>
+            <p id="progress-meta" class="progress-meta"></p>
+          </section>
+        </article>
+
+        <article class="panel panel-output reveal">
+          <div class="output-head">
+            <h2>Wynik</h2>
+            <div class="output-actions">
+              <button id="copy-btn" class="btn-muted" type="button" disabled>Kopiuj</button>
+              <a id="download-link" class="download-link" hidden>Pobierz .txt</a>
+            </div>
+          </div>
+          <label for="result" class="sr-only">Wynik transkrypcji</label>
+          <textarea id="result" rows="14" readonly placeholder="Tutaj pojawi się transkrypcja..."></textarea>
+        </article>
+      </section>
+
+      <section class="panel panel-history reveal">
+        <div class="history-head">
+          <h2>Ostatnie zadania</h2>
+          <button id="refresh-jobs" class="ghost-btn" type="button">Odśwież</button>
+        </div>
+        <ul id="jobs-list" class="jobs-list">
+          <li class="jobs-empty">Brak zapisanych zadań.</li>
+        </ul>
+      </section>
+    </main>
+
+    <script>
+      const THEME_KEY = "clip_to_text_theme";
+      const PREFS_KEY = "clip_to_text_prefs";
+
+      const form = document.getElementById("transcribe-form");
+      const fileInput = document.getElementById("video");
+      const fileNameEl = document.getElementById("file-name");
+      const dropZone = document.getElementById("drop-zone");
+      const languageSelect = document.getElementById("language");
+      const modeInputs = [...document.querySelectorAll('input[name="mode"]')];
+
+      const statusEl = document.getElementById("status");
+      const submitBtn = document.getElementById("submit-btn");
+      const cancelBtn = document.getElementById("cancel-btn");
+      const copyBtn = document.getElementById("copy-btn");
+      const resultEl = document.getElementById("result");
+      const downloadLink = document.getElementById("download-link");
+      const refreshJobsBtn = document.getElementById("refresh-jobs");
+      const jobsListEl = document.getElementById("jobs-list");
+
+      const progressBox = document.getElementById("progress-box");
+      const progressFill = document.getElementById("progress-fill");
+      const progressValue = document.getElementById("progress-value");
+      const progressLabel = document.getElementById("progress-label");
+      const progressMeta = document.getElementById("progress-meta");
+
+      const themeToggleBtn = document.getElementById("theme-toggle");
+
+      let activeJobId = null;
+      let activeJobCreatedAtMs = null;
+      let latestProgressValue = 0;
+      let progressTimerId = null;
+
+      function setStatus(message, type = "info") {
+        statusEl.textContent = message;
+        statusEl.className = `status ${type}`.trim();
+      }
+
+      function setLoading(loading) {
+        submitBtn.disabled = loading;
+        submitBtn.textContent = loading ? "Przetwarzanie..." : "Transkrybuj";
+        form.classList.toggle("is-loading", loading);
+        cancelBtn.hidden = !loading || !activeJobId;
+        if (loading) {
+          startProgressTimer();
+        } else {
+          stopProgressTimer();
+        }
+      }
+
+      function showProgress(visible) {
+        progressBox.hidden = !visible;
+      }
+
+      function setProgress(value, label = "") {
+        const clamped = Math.max(0, Math.min(100, Number(value) || 0));
+        progressFill.style.width = `${clamped}%`;
+        progressValue.textContent = `${Math.round(clamped)}%`;
+        latestProgressValue = clamped;
+        if (label) {
+          progressLabel.textContent = label;
+        }
+      }
+
+      function formatDuration(seconds) {
+        const total = Math.max(0, Math.floor(seconds || 0));
+        const h = Math.floor(total / 3600);
+        const m = Math.floor((total % 3600) / 60);
+        const s = total % 60;
+        if (h > 0) {
+          return `${h}h ${String(m).padStart(2, "0")}m`;
+        }
+        if (m > 0) {
+          return `${m}m ${String(s).padStart(2, "0")}s`;
+        }
+        return `${s}s`;
+      }
+
+      function formatQueueHint(payload) {
+        const queuePosition = Number(payload && payload.queue_position);
+        if (!Number.isFinite(queuePosition) || queuePosition <= 0) {
+          return "";
+        }
+
+        const queueSizeRaw = Number(payload && payload.queue_size);
+        const queueSize = Number.isFinite(queueSizeRaw) && queueSizeRaw > 0 ? queueSizeRaw : queuePosition;
+        return `Kolejka: ${queuePosition}/${Math.max(queuePosition, queueSize)}`;
+      }
+
+      function statusTextWithQueue(payload) {
+        const base = (payload && payload.message) || "Przetwarzanie...";
+        const hint = formatQueueHint(payload);
+        if (!hint) {
+          return base;
+        }
+        return `${base} (${hint.toLowerCase()})`;
+      }
+
+      function updateProgressMeta(payload = null) {
+        if (payload && Number.isFinite(Number(payload.created_at)) && Number(payload.created_at) > 0) {
+          activeJobCreatedAtMs = Number(payload.created_at) * 1000;
+        }
+
+        if (!activeJobCreatedAtMs) {
+          progressMeta.textContent = "";
+          return;
+        }
+
+        const elapsedSeconds = Math.max(0, (Date.now() - activeJobCreatedAtMs) / 1000);
+        let text = `Czas: ${formatDuration(elapsedSeconds)}`;
+
+        if (latestProgressValue >= 2 && latestProgressValue < 100) {
+          const totalSeconds = elapsedSeconds / (latestProgressValue / 100);
+          const etaSeconds = Math.max(0, totalSeconds - elapsedSeconds);
+          if (Number.isFinite(etaSeconds) && etaSeconds < 24 * 3600) {
+            text += ` • ETA: ${formatDuration(etaSeconds)}`;
+          }
+        }
+
+        if (payload) {
+          const queueHint = formatQueueHint(payload);
+          if (queueHint) {
+            text += ` • ${queueHint}`;
+          }
+        }
+
+        progressMeta.textContent = text;
+      }
+
+      function startProgressTimer() {
+        if (progressTimerId !== null) {
+          return;
+        }
+        progressTimerId = window.setInterval(() => {
+          if (progressBox.hidden) {
+            return;
+          }
+          updateProgressMeta();
+        }, 1000);
+      }
+
+      function stopProgressTimer() {
+        if (progressTimerId !== null) {
+          window.clearInterval(progressTimerId);
+          progressTimerId = null;
+        }
+      }
+
+      function updateFileState() {
+        const selectedFile = fileInput.files && fileInput.files[0];
+        if (!selectedFile) {
+          fileNameEl.textContent = "Brak pliku";
+          dropZone.classList.remove("has-file");
+          return;
+        }
+
+        const sizeMb = (selectedFile.size / (1024 * 1024)).toFixed(1);
+        fileNameEl.textContent = `${selectedFile.name} (${sizeMb} MB)`;
+        dropZone.classList.add("has-file");
+      }
+
+      function preventDragDefaults(event) {
+        event.preventDefault();
+        event.stopPropagation();
+      }
+
+      function setDropZoneActive(active) {
+        dropZone.classList.toggle("dragover", active);
+      }
+
+      function getSelectedMode() {
+        const selected = modeInputs.find((input) => input.checked);
+        return selected ? selected.value : "fast";
+      }
+
+      function savePreferences() {
+        const prefs = {
+          language: languageSelect.value,
+          mode: getSelectedMode(),
+        };
+        localStorage.setItem(PREFS_KEY, JSON.stringify(prefs));
+      }
+
+      function loadPreferences() {
+        const raw = localStorage.getItem(PREFS_KEY);
+        if (!raw) {
+          return;
+        }
+
+        try {
+          const prefs = JSON.parse(raw);
+          if (prefs.language === "pl" || prefs.language === "en") {
+            languageSelect.value = prefs.language;
+          }
+          if (prefs.mode === "fast" || prefs.mode === "accurate") {
+            modeInputs.forEach((input) => {
+              input.checked = input.value === prefs.mode;
+            });
+          }
+        } catch (_) {
+          return;
+        }
+      }
+
+      function preferredTheme() {
+        const saved = localStorage.getItem(THEME_KEY);
+        if (saved === "light" || saved === "dark") {
+          return saved;
+        }
+        return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+      }
+
+      function applyTheme(theme) {
+        document.documentElement.dataset.theme = theme;
+        themeToggleBtn.textContent = theme === "dark" ? "Tryb jasny" : "Tryb ciemny";
+      }
+
+      function toggleTheme() {
+        const current = document.documentElement.dataset.theme === "dark" ? "dark" : "light";
+        const next = current === "dark" ? "light" : "dark";
+        localStorage.setItem(THEME_KEY, next);
+        applyTheme(next);
+      }
+
+      async function createJob(formData) {
+        return new Promise((resolve, reject) => {
+          const xhr = new XMLHttpRequest();
+          xhr.open("POST", "/api/jobs");
+
+          xhr.upload.onprogress = (event) => {
+            if (!event.lengthComputable || !event.total) {
+              return;
+            }
+            const uploadProgress = Math.round((event.loaded / event.total) * 20);
+            setProgress(uploadProgress, "Wysyłanie pliku...");
+          };
+
+          xhr.onload = () => {
+            let payload = {};
+            try {
+              payload = JSON.parse(xhr.responseText || "{}");
+            } catch (_) {
+              payload = {};
+            }
+
+            if (xhr.status >= 200 && xhr.status < 300) {
+              resolve(payload);
+              return;
+            }
+            reject(new Error(payload.detail || "Nie udało się wysłać pliku."));
+          };
+
+          xhr.onerror = () => {
+            reject(new Error("Błąd połączenia podczas wysyłania pliku."));
+          };
+
+          xhr.send(formData);
+        });
+      }
+
+      async function fetchJobResult(jobId) {
+        const response = await fetch(`/api/jobs/${jobId}/result`);
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          throw new Error(payload.detail || "Nie udało się pobrać wyniku.");
+        }
+        return payload;
+      }
+
+      function applyJobResult(jobId, payload) {
+        const transcript = payload.transcript || "";
+        const fileName = payload.filename || "transkrypcja";
+
+        resultEl.value = transcript;
+        copyBtn.disabled = !transcript;
+
+        downloadLink.href = `/api/jobs/${jobId}/download`;
+        downloadLink.download = `${fileName}.txt`;
+        downloadLink.hidden = false;
+      }
+
+      async function waitForJobByPolling(jobId) {
+        while (true) {
+          const statusResponse = await fetch(`/api/jobs/${jobId}`);
+          const statusPayload = await statusResponse.json().catch(() => ({}));
+          if (!statusResponse.ok) {
+            throw new Error(statusPayload.detail || "Nie udało się pobrać statusu zadania.");
+          }
+
+          setProgress(statusPayload.progress, statusTextWithQueue(statusPayload));
+          updateProgressMeta(statusPayload);
+
+          if (statusPayload.state === "error") {
+            throw new Error(statusPayload.error || "Transkrypcja zakończyła się błędem.");
+          }
+
+          if (statusPayload.state === "done") {
+            return fetchJobResult(jobId);
+          }
+
+          await new Promise((resolve) => setTimeout(resolve, 1000));
+        }
+      }
+
+      function waitForJobBySSE(jobId) {
+        return new Promise((resolve, reject) => {
+          if (!("EventSource" in window)) {
+            reject(new Error("SSE not available"));
+            return;
+          }
+
+          let settled = false;
+          let source;
+
+          function cleanup() {
+            if (source) {
+              source.close();
+            }
+          }
+
+          try {
+            source = new EventSource(`/api/jobs/${jobId}/events`);
+          } catch (_) {
+            reject(new Error("SSE init failed"));
+            return;
+          }
+
+          source.onmessage = async (event) => {
+            let payload = {};
+            try {
+              payload = JSON.parse(event.data || "{}");
+            } catch (_) {
+              payload = {};
+            }
+
+            if (payload.progress !== undefined) {
+              setProgress(payload.progress, statusTextWithQueue(payload));
+              updateProgressMeta(payload);
+            }
+
+            if (payload.state === "error") {
+              if (settled) {
+                return;
+              }
+              settled = true;
+              cleanup();
+              reject(new Error(payload.error || payload.message || "Transkrypcja zakończyła się błędem."));
+              return;
+            }
+
+            if (payload.state === "done") {
+              if (settled) {
+                return;
+              }
+              settled = true;
+              cleanup();
+              try {
+                const result = await fetchJobResult(jobId);
+                resolve(result);
+              } catch (error) {
+                reject(error);
+              }
+            }
+          };
+
+          source.onerror = () => {
+            if (settled) {
+              return;
+            }
+            settled = true;
+            cleanup();
+            reject(new Error("SSE connection failed"));
+          };
+        });
+      }
+
+      async function waitForJob(jobId) {
+        try {
+          return await waitForJobBySSE(jobId);
+        } catch (_) {
+          return waitForJobByPolling(jobId);
+        }
+      }
+
+      function formatDate(unixSeconds) {
+        if (!unixSeconds) {
+          return "-";
+        }
+        const date = new Date(unixSeconds * 1000);
+        return date.toLocaleString("pl-PL", {
+          hour12: false,
+          year: "numeric",
+          month: "2-digit",
+          day: "2-digit",
+          hour: "2-digit",
+          minute: "2-digit",
+        });
+      }
+
+      function stateLabel(job) {
+        if (job.state === "done") {
+          return "Gotowe";
+        }
+        if (job.state === "error") {
+          return "Błąd";
+        }
+        if (job.stage === "cancelling") {
+          return "Anulowanie";
+        }
+        if (job.state === "processing") {
+          return "W trakcie";
+        }
+        return "W kolejce";
+      }
+
+      function stateClass(job) {
+        if (job.state === "done") {
+          return "ok";
+        }
+        if (job.state === "error") {
+          return "err";
+        }
+        return "run";
+      }
+
+      function clearJobsList() {
+        while (jobsListEl.firstChild) {
+          jobsListEl.removeChild(jobsListEl.firstChild);
+        }
+      }
+
+      function renderJobsList(jobs) {
+        clearJobsList();
+
+        if (!jobs.length) {
+          const empty = document.createElement("li");
+          empty.className = "jobs-empty";
+          empty.textContent = "Brak zapisanych zadań.";
+          jobsListEl.appendChild(empty);
+          return;
+        }
+
+        jobs.forEach((job) => {
+          const item = document.createElement("li");
+          const button = document.createElement("button");
+          button.type = "button";
+          button.className = "job-item";
+
+          const top = document.createElement("div");
+          top.className = "job-top";
+
+          const name = document.createElement("span");
+          name.className = "job-name";
+          name.textContent = job.filename;
+
+          const badge = document.createElement("span");
+          badge.className = `job-badge ${stateClass(job)}`;
+          badge.textContent = stateLabel(job);
+
+          top.append(name, badge);
+
+          const meta = document.createElement("p");
+          meta.className = "job-meta";
+          const queueHint = formatQueueHint(job);
+          meta.textContent = `${formatDate(job.created_at)} • ${job.language.toUpperCase()} • ${job.mode}${queueHint ? ` • ${queueHint}` : ""}`;
+
+          const msg = document.createElement("p");
+          msg.className = "job-msg";
+          msg.textContent = job.message || "-";
+
+          button.append(top, meta, msg);
+
+          button.addEventListener("click", async () => {
+            activeJobId = job.job_id;
+            cancelBtn.hidden = job.state !== "processing" && job.state !== "queued";
+
+            if (job.state === "done") {
+              try {
+                const result = await fetchJobResult(job.job_id);
+                applyJobResult(job.job_id, result);
+                setStatus("Załadowano wynik z historii.", "success");
+                activeJobCreatedAtMs = Number(job.created_at) * 1000 || null;
+                latestProgressValue = 100;
+                updateProgressMeta(job);
+                showProgress(false);
+              } catch (error) {
+                const message = error instanceof Error ? error.message : "Nie udało się załadować wyniku.";
+                setStatus(message, "error");
+              }
+              return;
+            }
+
+            if (job.state === "processing" || job.state === "queued") {
+              setLoading(true);
+              showProgress(true);
+              activeJobCreatedAtMs = Number(job.created_at) * 1000 || Date.now();
+              setProgress(job.progress || 0, statusTextWithQueue(job));
+              updateProgressMeta(job);
+              setStatus("Śledzę status wybranego zadania...", "info");
+
+              try {
+                const result = await waitForJob(job.job_id);
+                applyJobResult(job.job_id, result);
+                setProgress(100, "Transkrypcja zakończona.");
+                setStatus("Gotowe. Możesz pobrać wynik jako plik .txt.", "success");
+                await loadRecentJobs();
+              } catch (error) {
+                const message = error instanceof Error ? error.message : "Wystąpił błąd monitorowania zadania.";
+                setStatus(message, "error");
+              } finally {
+                setLoading(false);
+                activeJobId = null;
+                cancelBtn.hidden = true;
+              }
+              return;
+            }
+
+            const errorMessage = job.error || "To zadanie zakończyło się błędem.";
+            setStatus(errorMessage, "error");
+          });
+
+          item.appendChild(button);
+          jobsListEl.appendChild(item);
+        });
+      }
+
+      async function loadRecentJobs() {
+        try {
+          const response = await fetch("/api/jobs?limit=12");
+          const payload = await response.json().catch(() => ({}));
+          if (!response.ok) {
+            throw new Error(payload.detail || "Nie udało się pobrać historii zadań.");
+          }
+          renderJobsList(payload.jobs || []);
+        } catch (error) {
+          clearJobsList();
+          const item = document.createElement("li");
+          item.className = "jobs-empty";
+          item.textContent = "Nie udało się załadować historii.";
+          jobsListEl.appendChild(item);
+        }
+      }
+
+      async function submitNewJob(event) {
+        event.preventDefault();
+
+        if (!fileInput.files.length) {
+          setStatus("Wybierz plik wideo.", "error");
+          return;
+        }
+
+        setLoading(true);
+        showProgress(true);
+        setProgress(0, "Przygotowuję upload...");
+        activeJobCreatedAtMs = Date.now();
+        updateProgressMeta();
+        setStatus("Trwa transkrypcja, możesz śledzić postęp poniżej.", "info");
+        resultEl.value = "";
+        copyBtn.disabled = true;
+        downloadLink.hidden = true;
+
+        const formData = new FormData(form);
+
+        try {
+          const createdJob = await createJob(formData);
+          if (!createdJob.job_id) {
+            throw new Error("Backend nie zwrócił identyfikatora zadania.");
+          }
+
+          activeJobId = createdJob.job_id;
+          cancelBtn.hidden = false;
+          setProgress(20, "Plik przesłany. Zadanie uruchomione...");
+          updateProgressMeta();
+
+          const resultPayload = await waitForJob(createdJob.job_id);
+          applyJobResult(createdJob.job_id, resultPayload);
+
+          setProgress(100, "Transkrypcja zakończona.");
+          setStatus("Gotowe. Możesz pobrać wynik jako plik .txt.", "success");
+          await loadRecentJobs();
+        } catch (error) {
+          const message = error instanceof Error ? error.message : "Wystąpił nieoczekiwany błąd.";
+          setStatus(message, "error");
+          await loadRecentJobs();
+        } finally {
+          setLoading(false);
+          activeJobId = null;
+          cancelBtn.hidden = true;
+        }
+      }
+
+      async function cancelActiveJob() {
+        if (!activeJobId) {
+          return;
+        }
+
+        cancelBtn.disabled = true;
+        try {
+          const response = await fetch(`/api/jobs/${activeJobId}/cancel`, { method: "POST" });
+          const payload = await response.json().catch(() => ({}));
+          if (!response.ok) {
+            throw new Error(payload.detail || "Nie udało się anulować zadania.");
+          }
+
+          setStatus(payload.message || "Wysłano żądanie anulowania.", "info");
+          setProgress(payload.progress || 0, statusTextWithQueue(payload));
+          updateProgressMeta(payload);
+          await loadRecentJobs();
+        } catch (error) {
+          const message = error instanceof Error ? error.message : "Nie udało się anulować zadania.";
+          setStatus(message, "error");
+        } finally {
+          cancelBtn.disabled = false;
+        }
+      }
+
+      async function copyTranscript() {
+        if (!resultEl.value.trim()) {
+          return;
+        }
+
+        try {
+          await navigator.clipboard.writeText(resultEl.value);
+          setStatus("Skopiowano transkrypcję do schowka.", "success");
+        } catch (_) {
+          setStatus("Nie udało się skopiować do schowka.", "error");
+        }
+      }
+
+      fileInput.addEventListener("change", updateFileState);
+      form.addEventListener("submit", submitNewJob);
+      cancelBtn.addEventListener("click", cancelActiveJob);
+      copyBtn.addEventListener("click", copyTranscript);
+      refreshJobsBtn.addEventListener("click", loadRecentJobs);
+      themeToggleBtn.addEventListener("click", toggleTheme);
+
+      languageSelect.addEventListener("change", savePreferences);
+      modeInputs.forEach((input) => input.addEventListener("change", savePreferences));
+
+      dropZone.addEventListener("keydown", (event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          fileInput.click();
+        }
+      });
+
+      ["dragenter", "dragover"].forEach((eventName) => {
+        dropZone.addEventListener(eventName, (event) => {
+          preventDragDefaults(event);
+          setDropZoneActive(true);
+        });
+      });
+
+      ["dragleave", "drop"].forEach((eventName) => {
+        dropZone.addEventListener(eventName, (event) => {
+          preventDragDefaults(event);
+          setDropZoneActive(false);
+        });
+      });
+
+      dropZone.addEventListener("drop", (event) => {
+        const droppedFiles = event.dataTransfer && event.dataTransfer.files;
+        if (!droppedFiles || !droppedFiles.length) {
+          return;
+        }
+
+        try {
+          const transfer = new DataTransfer();
+          transfer.items.add(droppedFiles[0]);
+          fileInput.files = transfer.files;
+          updateFileState();
+        } catch (_) {
+          setStatus("Przeciąganie plików nie jest obsługiwane w tej przeglądarce.", "error");
+        }
+      });
+
+      const themeMediaQuery = window.matchMedia("(prefers-color-scheme: dark)");
+      const onSystemThemeChange = () => {
+        if (!localStorage.getItem(THEME_KEY)) {
+          applyTheme(preferredTheme());
+        }
+      };
+      if (typeof themeMediaQuery.addEventListener === "function") {
+        themeMediaQuery.addEventListener("change", onSystemThemeChange);
+      } else if (typeof themeMediaQuery.addListener === "function") {
+        themeMediaQuery.addListener(onSystemThemeChange);
+      }
+
+      loadPreferences();
+      applyTheme(preferredTheme());
+      loadRecentJobs();
+      setStatus("Aplikacja gotowa.", "info");
+    </script>
+  </body>
+</html>
