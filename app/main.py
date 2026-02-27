@@ -111,6 +111,7 @@ MODE_CONFIG: dict[str, dict[str, Any]] = {
 }
 
 JobState = Literal["queued", "processing", "done", "error"]
+OutputFormat = Literal["txt", "txt_srt"]
 logger = logging.getLogger("clip_to_text")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 if not logging.getLogger().handlers:
@@ -156,6 +157,7 @@ class UploadMetadata:
 @dataclass
 class CachedTranscript:
     transcript: str
+    subtitle_srt: str | None
     created_at: float
 
 
@@ -165,6 +167,7 @@ class TranscriptionJob:
     filename: str
     language: Literal["pl", "en"]
     mode: Literal["fast", "accurate"]
+    output_format: OutputFormat
     tmp_dir: Path
     video_path: Path
     audio_path: Path
@@ -173,8 +176,9 @@ class TranscriptionJob:
     state: JobState = "queued"
     stage: str = "queued"
     progress: float = 20.0
-    message: str = "Plik przesłany. Zadanie czeka na start."
+    message: str = "File uploaded. Job is queued."
     transcript: str | None = None
+    subtitle_srt: str | None = None
     error: str | None = None
     content_hash: str | None = None
     completed_at: float | None = None
@@ -183,6 +187,8 @@ class TranscriptionJob:
 class TranscriptionResponse(BaseModel):
     transcript: str
     filename: str
+    subtitle_srt: str | None = None
+    has_subtitles: bool = False
 
 
 class JobStartResponse(BaseModel):
@@ -194,11 +200,13 @@ class JobStatusResponse(BaseModel):
     filename: str
     language: Literal["pl", "en"]
     mode: Literal["fast", "accurate"]
+    output_format: OutputFormat
     state: JobState
     stage: str
     progress: float
     message: str
     ready: bool
+    has_subtitles: bool
     queue_position: int | None = None
     queue_size: int = 0
     created_at: float
@@ -211,10 +219,12 @@ class JobSummary(BaseModel):
     filename: str
     language: Literal["pl", "en"]
     mode: Literal["fast", "accurate"]
+    output_format: OutputFormat
     state: JobState
     stage: str
     progress: float
     message: str
+    has_subtitles: bool
     queue_position: int | None = None
     queue_size: int = 0
     created_at: float
@@ -234,7 +244,7 @@ _MODEL_CACHE: dict[tuple[str, str, str, int, int], Any] = {}
 _PIPELINE_CACHE: dict[tuple[str, str, str, int, int, int], Any] = {}
 _MODEL_LOCK = Lock()
 
-_TRANSCRIPT_CACHE: dict[tuple[str, str, str, str, str, str], CachedTranscript] = {}
+_TRANSCRIPT_CACHE: dict[tuple[str, str, str, str, str, str, str], CachedTranscript] = {}
 _TRANSCRIPT_CACHE_LOCK = Lock()
 
 _JOBS: dict[str, TranscriptionJob] = {}
@@ -284,6 +294,13 @@ def _db_execute(query: str, params: tuple[Any, ...] = ()) -> None:
         connection.commit()
 
 
+def _ensure_table_column(table: str, column: str, definition: str) -> None:
+    columns = {str(row["name"]) for row in _db_fetchall(f"PRAGMA table_info({table})")}
+    if column in columns:
+        return
+    _db_execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
 def _init_db() -> None:
     _db_execute(
         """
@@ -292,11 +309,13 @@ def _init_db() -> None:
             filename TEXT NOT NULL,
             language TEXT NOT NULL,
             mode TEXT NOT NULL,
+            output_format TEXT NOT NULL DEFAULT 'txt',
             state TEXT NOT NULL,
             stage TEXT NOT NULL,
             progress REAL NOT NULL,
             message TEXT NOT NULL,
             transcript TEXT,
+            subtitle_srt TEXT,
             error TEXT,
             content_hash TEXT,
             video_path TEXT,
@@ -312,10 +331,14 @@ def _init_db() -> None:
         CREATE TABLE IF NOT EXISTS transcript_cache (
             cache_key TEXT PRIMARY KEY,
             transcript TEXT NOT NULL,
+            subtitle_srt TEXT,
             created_at REAL NOT NULL
         )
         """
     )
+    _ensure_table_column("jobs", "output_format", "TEXT NOT NULL DEFAULT 'txt'")
+    _ensure_table_column("jobs", "subtitle_srt", "TEXT")
+    _ensure_table_column("transcript_cache", "subtitle_srt", "TEXT")
     _db_execute("CREATE INDEX IF NOT EXISTS idx_jobs_created_at ON jobs(created_at DESC)")
     _db_execute("CREATE INDEX IF NOT EXISTS idx_jobs_state ON jobs(state)")
     _db_execute("CREATE INDEX IF NOT EXISTS idx_jobs_completed_at ON jobs(completed_at)")
@@ -330,15 +353,15 @@ def _close_db() -> None:
 
 
 def _safe_filename_stem(filename: str) -> str:
-    stem = Path(filename).stem or "transkrypcja"
+    stem = Path(filename).stem or "transcription"
     stem = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("._")
-    return stem or "transkrypcja"
+    return stem or "transcription"
 
 
 def _validate_extension(filename: str) -> str:
     suffix = Path(filename).suffix.lower()
     if suffix not in ALLOWED_EXTENSIONS:
-        raise InvalidFileTypeError("Obsługiwane formaty: .mp4, .mov, .mkv.")
+        raise InvalidFileTypeError("Supported formats: .mp4, .mov, .mkv.")
     return suffix
 
 
@@ -348,21 +371,21 @@ def _validate_content_type(upload: UploadFile) -> None:
         return
     if content_type in ALLOWED_CONTENT_TYPES or content_type.startswith("video/"):
         return
-    raise InvalidFileTypeError(f"Nieobsługiwany typ MIME: {content_type}")
+    raise InvalidFileTypeError(f"Unsupported MIME type: {content_type}")
 
 
 def _validate_magic_header(header: bytes, suffix: str) -> None:
     if len(header) < 12:
-        raise InvalidFileTypeError("Plik jest uszkodzony lub ma niepoprawny format.")
+        raise InvalidFileTypeError("The file is corrupted or has an invalid format.")
 
     if suffix in {".mp4", ".mov"}:
         if b"ftyp" not in header[4:16]:
-            raise InvalidFileTypeError("Plik nie wygląda na poprawny kontener MP4/MOV.")
+            raise InvalidFileTypeError("The file does not look like a valid MP4/MOV container.")
         return
 
     if suffix == ".mkv":
         if not header.startswith(MKV_SIGNATURE):
-            raise InvalidFileTypeError("Plik nie wygląda na poprawny kontener MKV.")
+            raise InvalidFileTypeError("The file does not look like a valid MKV container.")
         return
 
 
@@ -377,7 +400,7 @@ def _run_command(command: list[str]) -> subprocess.CompletedProcess[str]:
         )
     except FileNotFoundError as exc:
         raise TranscriptionRuntimeError(
-            f"Brak narzędzia w PATH: {command[0]}. Zainstaluj ffmpeg i uruchom aplikację ponownie."
+            f"Required tool not found in PATH: {command[0]}. Install ffmpeg and restart the app."
         ) from exc
 
 
@@ -399,7 +422,7 @@ def _save_upload(upload: UploadFile, destination: Path, suffix: str) -> UploadMe
             total_size += len(chunk)
             if total_size > MAX_UPLOAD_BYTES:
                 raise FileTooLargeError(
-                    f"Plik jest za duży. Maksymalny rozmiar to {MAX_UPLOAD_MB} MB."
+                    f"The file is too large. Maximum size is {MAX_UPLOAD_MB} MB."
                 )
 
             output_file.write(chunk)
@@ -426,7 +449,7 @@ def _probe_duration_seconds(video_path: Path) -> float | None:
     ]
     probe = _run_command(command)
     if probe.returncode != 0:
-        stderr = probe.stderr.strip() or "Nie udało się odczytać długości wideo."
+        stderr = probe.stderr.strip() or "Failed to read video duration."
         raise TranscriptionRuntimeError(stderr)
 
     output = (probe.stdout or "").strip()
@@ -440,7 +463,7 @@ def _probe_duration_seconds(video_path: Path) -> float | None:
 
     if duration > MAX_VIDEO_DURATION_SECONDS:
         raise VideoTooLongError(
-            f"Nagranie jest za długie ({int(duration)} s). Limit to {MAX_VIDEO_DURATION_SECONDS} s."
+            f"The recording is too long ({int(duration)} s). Limit: {MAX_VIDEO_DURATION_SECONDS} s."
         )
     return duration
 
@@ -467,11 +490,11 @@ def _extract_audio_to_wav(video_path: Path, audio_path: Path) -> None:
     )
     ffmpeg = _run_command(command)
     if ffmpeg.returncode != 0:
-        stderr = ffmpeg.stderr.strip() or "Nie udało się wyodrębnić audio z filmu."
+        stderr = ffmpeg.stderr.strip() or "Failed to extract audio from the video."
         normalized = stderr.lower()
         no_audio_patterns = ("stream map", "matches no streams", "does not contain any stream")
         if any(pattern in normalized for pattern in no_audio_patterns):
-            raise NoAudioStreamError("W pliku nie znaleziono ścieżki audio.")
+            raise NoAudioStreamError("No audio track found in the file.")
         raise TranscriptionRuntimeError(stderr)
 
 
@@ -489,7 +512,7 @@ def _model_cache_key(mode: Literal["fast", "accurate"]) -> tuple[str, str, str, 
 def _get_whisper_model(mode: Literal["fast", "accurate"]) -> Any:
     if WhisperModel is None:
         raise TranscriptionRuntimeError(
-            "Brakuje pakietu faster-whisper. Zainstaluj dependencies z requirements.txt."
+            "Missing faster-whisper package. Install dependencies from requirements.txt."
         )
 
     cache_key = _model_cache_key(mode)
@@ -539,21 +562,22 @@ def _clear_job_cancelled(job_id: str) -> None:
 
 def _raise_if_cancelled(job_id: str) -> None:
     if _is_job_cancelled(job_id):
-        raise TranscriptionCancelledError("Zadanie zostało anulowane.")
+        raise TranscriptionCancelledError("Job has been cancelled.")
 
 
 def _transcribe_audio(
     audio_path: Path,
     language: Literal["pl", "en"],
     mode: Literal["fast", "accurate"],
+    output_format: OutputFormat,
     progress_callback: Callable[[float, str], None] | None = None,
     cancel_callback: Callable[[], None] | None = None,
-) -> str:
+) -> tuple[str, str | None]:
     if cancel_callback is not None:
         cancel_callback()
 
     if progress_callback is not None:
-        progress_callback(45.0, "Ładuję model i rozpoczynam transkrypcję...")
+        progress_callback(45.0, "Loading model and starting transcription...")
 
     model = _get_whisper_model(mode)
     config = MODE_CONFIG[mode]
@@ -564,7 +588,8 @@ def _transcribe_audio(
         "best_of": int(config["best_of"]),
         "vad_filter": bool(config["vad_filter"]),
         "condition_on_previous_text": bool(config["condition_on_previous_text"]),
-        "without_timestamps": bool(config["without_timestamps"]),
+        # Timings are required for SRT generation, otherwise keep fast profile.
+        "without_timestamps": bool(config["without_timestamps"]) if output_format == "txt" else False,
         "temperature": 0.0,
     }
 
@@ -580,6 +605,7 @@ def _transcribe_audio(
 
     duration = float(getattr(info, "duration", 0.0) or 0.0)
     pieces: list[str] = []
+    subtitle_segments: list[tuple[float, float, str]] = []
     last_progress = 45.0
 
     for segment in segments:
@@ -589,6 +615,13 @@ def _transcribe_audio(
         text = (getattr(segment, "text", "") or "").strip()
         if text:
             pieces.append(text)
+            if output_format == "txt_srt":
+                segment_start = getattr(segment, "start", None)
+                segment_end = getattr(segment, "end", None)
+                if segment_start is not None and segment_end is not None:
+                    start_value = max(0.0, float(segment_start))
+                    end_value = max(start_value, float(segment_end))
+                    subtitle_segments.append((start_value, end_value, text))
 
         if progress_callback is None:
             continue
@@ -601,24 +634,59 @@ def _transcribe_audio(
             progress = min(95.0, last_progress + max(0.8, (95.0 - last_progress) * 0.18))
 
         if progress - last_progress >= 1.0:
-            progress_callback(progress, "Transkrybuję audio...")
+            progress_callback(progress, "Transcribing audio...")
             last_progress = progress
 
     if progress_callback is not None:
-        progress_callback(98.0, "Finalizuję wynik...")
+        progress_callback(98.0, "Finalizing output...")
 
     transcript = _normalize_transcript(" ".join(pieces))
     if not transcript:
         raise TranscriptionRuntimeError(
-            "Transkrypcja zwróciła pusty wynik. Sprawdź jakość audio w pliku."
+            "Transcription returned an empty result. Check audio quality in the file."
         )
-    return transcript
+    subtitle_srt = _build_srt(subtitle_segments) if output_format == "txt_srt" else None
+    return transcript, subtitle_srt
 
 
 def _normalize_transcript(text: str) -> str:
     normalized = re.sub(r"\s+", " ", text).strip()
     normalized = re.sub(r"\s+([,.;:!?])", r"\1", normalized)
     return normalized
+
+
+def _format_srt_timestamp(seconds: float) -> str:
+    total_ms = max(0, int(round(seconds * 1000)))
+    hours = total_ms // 3_600_000
+    minutes = (total_ms % 3_600_000) // 60_000
+    secs = (total_ms % 60_000) // 1000
+    millis = total_ms % 1000
+    return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
+
+
+def _build_srt(segments: list[tuple[float, float, str]]) -> str | None:
+    if not segments:
+        return None
+
+    lines: list[str] = []
+    for index, (start, end, text) in enumerate(segments, start=1):
+        clean_text = _normalize_transcript(text)
+        if not clean_text:
+            continue
+        if end <= start:
+            end = start + 0.4
+
+        lines.extend(
+            [
+                str(index),
+                f"{_format_srt_timestamp(start)} --> {_format_srt_timestamp(end)}",
+                clean_text,
+                "",
+            ]
+        )
+
+    subtitle = "\n".join(lines).strip()
+    return subtitle or None
 
 
 def _remove_file(path: Path) -> None:
@@ -653,12 +721,14 @@ def _row_to_job(row: sqlite3.Row) -> TranscriptionJob:
     video_path = Path(row["video_path"]) if row["video_path"] else Path("")
     audio_path = Path(row["audio_path"]) if row["audio_path"] else Path("")
     tmp_dir = video_path.parent if row["video_path"] else Path("")
+    output_format: OutputFormat = "txt_srt" if row["output_format"] == "txt_srt" else "txt"
 
     return TranscriptionJob(
         id=row["id"],
         filename=row["filename"],
         language=row["language"],
         mode=row["mode"],
+        output_format=output_format,
         tmp_dir=tmp_dir,
         video_path=video_path,
         audio_path=audio_path,
@@ -669,6 +739,7 @@ def _row_to_job(row: sqlite3.Row) -> TranscriptionJob:
         progress=float(row["progress"]),
         message=row["message"],
         transcript=row["transcript"],
+        subtitle_srt=row["subtitle_srt"],
         error=row["error"],
         content_hash=row["content_hash"],
         completed_at=row["completed_at"],
@@ -679,19 +750,21 @@ def _upsert_job(job: TranscriptionJob) -> None:
     _db_execute(
         """
         INSERT INTO jobs (
-            id, filename, language, mode, state, stage, progress, message,
-            transcript, error, content_hash, video_path, audio_path,
+            id, filename, language, mode, output_format, state, stage, progress, message,
+            transcript, subtitle_srt, error, content_hash, video_path, audio_path,
             created_at, updated_at, completed_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
             filename=excluded.filename,
             language=excluded.language,
             mode=excluded.mode,
+            output_format=excluded.output_format,
             state=excluded.state,
             stage=excluded.stage,
             progress=excluded.progress,
             message=excluded.message,
             transcript=excluded.transcript,
+            subtitle_srt=excluded.subtitle_srt,
             error=excluded.error,
             content_hash=excluded.content_hash,
             video_path=excluded.video_path,
@@ -704,11 +777,13 @@ def _upsert_job(job: TranscriptionJob) -> None:
             job.filename,
             job.language,
             job.mode,
+            job.output_format,
             job.state,
             job.stage,
             job.progress,
             job.message,
             job.transcript,
+            job.subtitle_srt,
             job.error,
             job.content_hash,
             str(job.video_path) if str(job.video_path) else None,
@@ -735,6 +810,7 @@ def _update_job(
     progress: float | None = None,
     message: str | None = None,
     transcript: str | None = None,
+    subtitle_srt: str | None = None,
     error: str | None = None,
 ) -> None:
     now = time.time()
@@ -757,6 +833,8 @@ def _update_job(
         job.message = message
     if transcript is not None:
         job.transcript = transcript
+    if subtitle_srt is not None:
+        job.subtitle_srt = subtitle_srt
     job.error = error
     job.updated_at = now
 
@@ -780,7 +858,7 @@ def _get_job_snapshot(job_id: str) -> TranscriptionJob | None:
 def _require_job_snapshot(job_id: str) -> TranscriptionJob:
     job = _get_job_snapshot(job_id)
     if job is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Nie znaleziono zadania.")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found.")
     return job
 
 
@@ -810,11 +888,13 @@ def _build_job_status(job: TranscriptionJob) -> JobStatusResponse:
         filename=job.filename,
         language=job.language,
         mode=job.mode,
+        output_format=job.output_format,
         state=job.state,
         stage=job.stage,
         progress=round(job.progress, 1),
         message=job.message,
         ready=job.state == "done",
+        has_subtitles=bool(job.subtitle_srt),
         queue_position=queue_position,
         queue_size=queue_size,
         created_at=job.created_at,
@@ -830,10 +910,12 @@ def _build_job_summary(job: TranscriptionJob) -> JobSummary:
         filename=job.filename,
         language=job.language,
         mode=job.mode,
+        output_format=job.output_format,
         state=job.state,
         stage=job.stage,
         progress=round(job.progress, 1),
         message=job.message,
+        has_subtitles=bool(job.subtitle_srt),
         queue_position=queue_position,
         queue_size=queue_size,
         created_at=job.created_at,
@@ -846,12 +928,14 @@ def _transcript_cache_key(
     content_hash: str,
     language: Literal["pl", "en"],
     mode: Literal["fast", "accurate"],
-) -> tuple[str, str, str, str, str, str]:
+    output_format: OutputFormat,
+) -> tuple[str, str, str, str, str, str, str]:
     config = MODE_CONFIG[mode]
     return (
         content_hash,
         language,
         mode,
+        output_format,
         str(config["model_size"]),
         WHISPER_DEVICE,
         WHISPER_COMPUTE_TYPE,
@@ -898,18 +982,22 @@ def _get_cached_transcript(
     content_hash: str,
     language: Literal["pl", "en"],
     mode: Literal["fast", "accurate"],
-) -> str | None:
+    output_format: OutputFormat,
+) -> CachedTranscript | None:
     if TRANSCRIPT_CACHE_TTL_SECONDS <= 0:
         return None
 
-    cache_key = _transcript_cache_key(content_hash, language, mode)
+    cache_key = _transcript_cache_key(content_hash, language, mode, output_format)
 
     with _TRANSCRIPT_CACHE_LOCK:
         cached = _TRANSCRIPT_CACHE.get(cache_key)
         if cached is not None and time.time() - cached.created_at <= TRANSCRIPT_CACHE_TTL_SECONDS:
-            return cached.transcript
+            return cached
 
-    row = _db_fetchone("SELECT transcript, created_at FROM transcript_cache WHERE cache_key = ?", (json.dumps(cache_key),))
+    row = _db_fetchone(
+        "SELECT transcript, subtitle_srt, created_at FROM transcript_cache WHERE cache_key = ?",
+        (json.dumps(cache_key),),
+    )
     if row is None:
         return None
 
@@ -917,37 +1005,48 @@ def _get_cached_transcript(
         _db_execute("DELETE FROM transcript_cache WHERE cache_key = ?", (json.dumps(cache_key),))
         return None
 
-    transcript = str(row["transcript"])
+    cached = CachedTranscript(
+        transcript=str(row["transcript"]),
+        subtitle_srt=row["subtitle_srt"],
+        created_at=float(row["created_at"]),
+    )
     with _TRANSCRIPT_CACHE_LOCK:
-        _TRANSCRIPT_CACHE[cache_key] = CachedTranscript(transcript=transcript, created_at=float(row["created_at"]))
-    return transcript
+        _TRANSCRIPT_CACHE[cache_key] = cached
+    return cached
 
 
 def _set_cached_transcript(
     content_hash: str | None,
     language: Literal["pl", "en"],
     mode: Literal["fast", "accurate"],
+    output_format: OutputFormat,
     transcript: str,
+    subtitle_srt: str | None,
 ) -> None:
     if not content_hash or TRANSCRIPT_CACHE_TTL_SECONDS <= 0:
         return
 
-    cache_key = _transcript_cache_key(content_hash, language, mode)
+    cache_key = _transcript_cache_key(content_hash, language, mode, output_format)
     now = time.time()
 
     with _TRANSCRIPT_CACHE_LOCK:
-        _TRANSCRIPT_CACHE[cache_key] = CachedTranscript(transcript=transcript, created_at=now)
+        _TRANSCRIPT_CACHE[cache_key] = CachedTranscript(
+            transcript=transcript,
+            subtitle_srt=subtitle_srt,
+            created_at=now,
+        )
 
     serialized_key = json.dumps(cache_key)
     _db_execute(
         """
-        INSERT INTO transcript_cache (cache_key, transcript, created_at)
-        VALUES (?, ?, ?)
+        INSERT INTO transcript_cache (cache_key, transcript, subtitle_srt, created_at)
+        VALUES (?, ?, ?, ?)
         ON CONFLICT(cache_key) DO UPDATE SET
             transcript=excluded.transcript,
+            subtitle_srt=excluded.subtitle_srt,
             created_at=excluded.created_at
         """,
-        (serialized_key, transcript, now),
+        (serialized_key, transcript, subtitle_srt, now),
     )
 
 
@@ -1018,7 +1117,7 @@ def _maintenance_loop() -> None:
         try:
             _cleanup_expired_jobs()
         except Exception:
-            logger.exception("Błąd cyklicznego maintenance.")
+            logger.exception("Background maintenance loop failed.")
 
 
 def _mark_stale_jobs_after_restart() -> None:
@@ -1032,8 +1131,8 @@ def _mark_stale_jobs_after_restart() -> None:
         job.state = "error"
         job.stage = "interrupted"
         job.progress = max(job.progress, 100.0)
-        job.message = "Zadanie przerwane przez restart aplikacji."
-        job.error = "Przerwano podczas restartu serwera."
+        job.message = "Job interrupted by app restart."
+        job.error = "Interrupted during server restart."
         job.updated_at = now
         job.completed_at = now
         _upsert_job(job)
@@ -1055,7 +1154,7 @@ def _run_transcription_job(job_id: str) -> None:
             state="processing",
             stage="validating",
             progress=25.0,
-            message="Przygotowuję transkrypcję...",
+            message="Preparing transcription...",
             error=None,
         )
 
@@ -1065,7 +1164,7 @@ def _run_transcription_job(job_id: str) -> None:
             state="processing",
             stage="extracting_audio",
             progress=35.0,
-            message="Wyodrębniam audio z pliku wideo...",
+            message="Extracting audio from video...",
             error=None,
         )
         _extract_audio_to_wav(job.video_path, job.audio_path)
@@ -1080,22 +1179,31 @@ def _run_transcription_job(job_id: str) -> None:
                 error=None,
             )
 
-        transcript = _transcribe_audio(
+        transcript, subtitle_srt = _transcribe_audio(
             job.audio_path,
             job.language,
             job.mode,
+            job.output_format,
             progress_callback=on_progress,
             cancel_callback=lambda: _raise_if_cancelled(job_id),
         )
 
-        _set_cached_transcript(job.content_hash, job.language, job.mode, transcript)
+        _set_cached_transcript(
+            job.content_hash,
+            job.language,
+            job.mode,
+            job.output_format,
+            transcript,
+            subtitle_srt,
+        )
         _update_job(
             job_id,
             state="done",
             stage="done",
             progress=100.0,
-            message="Gotowe.",
+            message="Done.",
             transcript=transcript,
+            subtitle_srt=subtitle_srt,
             error=None,
         )
         logger.info("Job %s finished successfully", job_id)
@@ -1105,7 +1213,7 @@ def _run_transcription_job(job_id: str) -> None:
             state="error",
             stage="cancelled",
             progress=100.0,
-            message="Zadanie anulowane.",
+            message="Job cancelled.",
             error=str(exc),
         )
         logger.info("Job %s cancelled", job_id)
@@ -1121,7 +1229,7 @@ def _run_transcription_job(job_id: str) -> None:
             state="error",
             stage="error",
             progress=100.0,
-            message="Błąd transkrypcji.",
+            message="Transcription failed.",
             error=str(exc),
         )
         logger.warning("Job %s failed: %s", job_id, exc)
@@ -1131,8 +1239,8 @@ def _run_transcription_job(job_id: str) -> None:
             state="error",
             stage="error",
             progress=100.0,
-            message="Wystąpił nieoczekiwany błąd podczas transkrypcji.",
-            error="Nieoczekiwany błąd przetwarzania.",
+            message="An unexpected error occurred during transcription.",
+            error="Unexpected processing error.",
         )
         logger.exception("Job %s failed with unexpected error", job_id)
     finally:
@@ -1149,9 +1257,10 @@ def _process_upload(
     upload: UploadFile,
     language: Literal["pl", "en"],
     mode: Literal["fast", "accurate"],
-) -> str:
+    output_format: OutputFormat,
+) -> tuple[str, str | None]:
     if not upload.filename:
-        raise InvalidFileTypeError("Brak nazwy pliku.")
+        raise InvalidFileTypeError("Missing filename.")
 
     _validate_content_type(upload)
     suffix = _validate_extension(upload.filename)
@@ -1163,15 +1272,22 @@ def _process_upload(
 
         metadata = _save_upload(upload, video_path, suffix)
         _probe_duration_seconds(video_path)
-        cached_transcript = _get_cached_transcript(metadata.content_hash, language, mode)
-        if cached_transcript is not None:
-            return cached_transcript
+        cached_result = _get_cached_transcript(metadata.content_hash, language, mode, output_format)
+        if cached_result is not None:
+            return cached_result.transcript, cached_result.subtitle_srt
 
         _extract_audio_to_wav(video_path, audio_path)
 
-        transcript = _transcribe_audio(audio_path, language, mode)
-        _set_cached_transcript(metadata.content_hash, language, mode, transcript)
-        return transcript
+        transcript, subtitle_srt = _transcribe_audio(audio_path, language, mode, output_format)
+        _set_cached_transcript(
+            metadata.content_hash,
+            language,
+            mode,
+            output_format,
+            transcript,
+            subtitle_srt,
+        )
+        return transcript, subtitle_srt
 
 
 def _serialize_model(model: BaseModel) -> dict[str, Any]:
@@ -1189,9 +1305,9 @@ def startup_warmup() -> None:
     _cleanup_expired_jobs()
 
     if not FFMPEG_AVAILABLE:
-        logger.warning("Nie znaleziono ffmpeg (%s) w PATH.", FFMPEG_BIN)
+        logger.warning("ffmpeg not found in PATH (%s).", FFMPEG_BIN)
     if MAX_VIDEO_DURATION_SECONDS > 0 and not FFPROBE_AVAILABLE:
-        logger.warning("Nie znaleziono ffprobe (%s) w PATH.", FFPROBE_BIN)
+        logger.warning("ffprobe not found in PATH (%s).", FFPROBE_BIN)
 
     _MAINTENANCE_STOP.clear()
     if _MAINTENANCE_THREAD is None or not _MAINTENANCE_THREAD.is_alive():
@@ -1239,6 +1355,7 @@ async def create_job(
     file: UploadFile = File(...),
     language: Literal["pl", "en"] = Form("pl"),
     mode: Literal["fast", "accurate"] = Form("fast"),
+    output_format: OutputFormat = Form("txt"),
 ) -> JobStartResponse:
     _cleanup_expired_jobs()
 
@@ -1246,13 +1363,13 @@ async def create_job(
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail=(
-                "Kolejka jest pełna. Spróbuj ponownie za chwilę "
-                f"(maks. {MAX_PENDING_JOBS} aktywnych zadań)."
+                "Queue is full. Try again in a moment "
+                f"(max {MAX_PENDING_JOBS} active jobs)."
             ),
         )
 
     if not file.filename:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Brak nazwy pliku.")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing filename.")
 
     try:
         _validate_content_type(file)
@@ -1283,7 +1400,7 @@ async def create_job(
         _remove_temp_dir(temp_dir)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Nie udało się zapisać przesłanego pliku.",
+            detail="Failed to save uploaded file.",
         ) from exc
     finally:
         await file.close()
@@ -1303,14 +1420,15 @@ async def create_job(
             detail=str(exc),
         ) from exc
 
-    cached_transcript = _get_cached_transcript(metadata.content_hash, language, mode)
-    if cached_transcript is not None:
+    cached_result = _get_cached_transcript(metadata.content_hash, language, mode, output_format)
+    if cached_result is not None:
         _remove_temp_dir(temp_dir)
         cached_job = TranscriptionJob(
             id=job_id,
             filename=safe_name,
             language=language,
             mode=mode,
+            output_format=output_format,
             tmp_dir=temp_dir,
             video_path=video_path,
             audio_path=audio_path,
@@ -1319,8 +1437,9 @@ async def create_job(
             state="done",
             stage="done",
             progress=100.0,
-            message="Gotowe (cache).",
-            transcript=cached_transcript,
+            message="Done (cache hit).",
+            transcript=cached_result.transcript,
+            subtitle_srt=cached_result.subtitle_srt,
             error=None,
             content_hash=metadata.content_hash,
             completed_at=now,
@@ -1335,6 +1454,7 @@ async def create_job(
         filename=safe_name,
         language=language,
         mode=mode,
+        output_format=output_format,
         tmp_dir=temp_dir,
         video_path=video_path,
         audio_path=audio_path,
@@ -1346,7 +1466,7 @@ async def create_job(
     with _JOBS_LOCK:
         _JOBS[job_id] = job
     _upsert_job(job)
-    logger.info("Queued job %s (%s, %s)", job_id, language, mode)
+    logger.info("Queued job %s (%s, %s, %s)", job_id, language, mode, output_format)
 
     future = _WORKER_POOL.submit(_run_transcription_job, job_id)
     with _JOB_FUTURES_LOCK:
@@ -1370,7 +1490,7 @@ async def cancel_job(job_id: str) -> JobStatusResponse:
     if job.state in {"done", "error"}:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="Zadanie jest już zakończone.",
+            detail="Job is already finished.",
         )
 
     _mark_job_cancelled(job_id)
@@ -1388,8 +1508,8 @@ async def cancel_job(job_id: str) -> JobStatusResponse:
             state="error",
             stage="cancelled",
             progress=100.0,
-            message="Zadanie anulowane.",
-            error="Zadanie anulowano przed uruchomieniem.",
+            message="Job cancelled.",
+            error="Job was cancelled before it started.",
         )
         finished = _get_job_snapshot(job_id)
         if finished is not None:
@@ -1402,7 +1522,7 @@ async def cancel_job(job_id: str) -> JobStatusResponse:
             job_id,
             state="processing",
             stage="cancelling",
-            message="Próba anulowania zadania...",
+            message="Attempting to cancel job...",
             error=None,
         )
 
@@ -1426,9 +1546,9 @@ async def stream_job_events(job_id: str) -> StreamingResponse:
                     "state": "error",
                     "stage": "error",
                     "progress": 100,
-                    "message": "Nie znaleziono zadania.",
+                    "message": "Job not found.",
                     "ready": False,
-                    "error": "Nie znaleziono zadania.",
+                    "error": "Job not found.",
                 }
                 yield f"event: error\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
                 break
@@ -1454,7 +1574,7 @@ async def stream_job_events(job_id: str) -> StreamingResponse:
                     "state": job.state,
                     "stage": job.stage,
                     "progress": job.progress,
-                    "message": "Połączenie SSE wygasło. Odśwież status ręcznie.",
+                    "message": "SSE connection timed out. Refresh status manually.",
                     "ready": False,
                     "error": None,
                 }
@@ -1485,22 +1605,50 @@ async def get_job_result(job_id: str) -> TranscriptionResponse:
     if job.state == "error":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=job.error or "Transkrypcja zakończyła się błędem.",
+            detail=job.error or "Transcription failed.",
         )
     if job.state != "done" or not job.transcript:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="Wynik nie jest jeszcze gotowy.",
+            detail="Result is not ready yet.",
         )
 
-    return TranscriptionResponse(transcript=job.transcript, filename=job.filename)
+    return TranscriptionResponse(
+        transcript=job.transcript,
+        filename=job.filename,
+        subtitle_srt=job.subtitle_srt,
+        has_subtitles=bool(job.subtitle_srt),
+    )
 
 
 @app.get("/api/jobs/{job_id}/download")
-async def download_job_result(job_id: str) -> PlainTextResponse:
+async def download_job_result(
+    job_id: str,
+    file_format: Literal["txt", "srt"] = Query("txt", alias="format"),
+) -> PlainTextResponse:
     result = await get_job_result(job_id)
+    if file_format == "srt":
+        if not result.subtitle_srt:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="This job does not contain SRT subtitles.",
+            )
+        headers = {"Content-Disposition": f'attachment; filename="{result.filename}.srt"'}
+        return PlainTextResponse(result.subtitle_srt, headers=headers)
+
     headers = {"Content-Disposition": f'attachment; filename="{result.filename}.txt"'}
     return PlainTextResponse(result.transcript, headers=headers)
+
+
+@app.get("/api/jobs/{job_id}/subtitle")
+async def get_job_subtitle(job_id: str) -> PlainTextResponse:
+    result = await get_job_result(job_id)
+    if not result.subtitle_srt:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This job does not contain SRT subtitles.",
+        )
+    return PlainTextResponse(result.subtitle_srt)
 
 
 @app.post("/api/transcribe", response_model=TranscriptionResponse)
@@ -1508,11 +1656,18 @@ async def transcribe(
     file: UploadFile = File(...),
     language: Literal["pl", "en"] = Form("pl"),
     mode: Literal["fast", "accurate"] = Form("fast"),
+    output_format: OutputFormat = Form("txt"),
 ) -> TranscriptionResponse:
-    safe_name = _safe_filename_stem(file.filename or "transkrypcja")
+    safe_name = _safe_filename_stem(file.filename or "transcription")
 
     try:
-        transcript = await run_in_threadpool(_process_upload, file, language, mode)
+        transcript, subtitle_srt = await run_in_threadpool(
+            _process_upload,
+            file,
+            language,
+            mode,
+            output_format,
+        )
     except InvalidFileTypeError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     except FileTooLargeError as exc:
@@ -1532,7 +1687,12 @@ async def transcribe(
     finally:
         await file.close()
 
-    return TranscriptionResponse(transcript=transcript, filename=safe_name)
+    return TranscriptionResponse(
+        transcript=transcript,
+        filename=safe_name,
+        subtitle_srt=subtitle_srt,
+        has_subtitles=bool(subtitle_srt),
+    )
 
 
 @app.get("/health")

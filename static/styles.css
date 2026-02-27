@@ -520,6 +520,12 @@ textarea::placeholder {
   border: 1px solid rgba(217, 119, 6, 0.34);
 }
 
+.download-link.subtitle {
+  color: #0b3f66;
+  background: linear-gradient(140deg, #9ed7ff, #7fc8ff);
+  border-color: rgba(18, 90, 146, 0.34);
+}
+
 .jobs-list {
   margin: 0;
   padding: 0;

@@ -62,6 +62,11 @@ def test_cancel_missing_job_returns_not_found() -> None:
     assert response.status_code == 404
 
 
+def test_subtitle_missing_job_returns_not_found() -> None:
+    response = request("GET", "/api/jobs/does-not-exist/subtitle")
+    assert response.status_code == 404
+
+
 def test_create_job_rejects_invalid_extension() -> None:
     files = {"file": ("notes.txt", b"hello", "text/plain")}
     data = {"language": "pl", "mode": "fast"}
