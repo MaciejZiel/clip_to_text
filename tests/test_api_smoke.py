@@ -42,6 +42,9 @@ def test_health_endpoint_shape() -> None:
     assert "cache_size" in payload
     assert "persisted_jobs" in payload
     assert "max_pending_jobs" in payload
+    assert "eta_cache_entries" in payload
+    assert "eta_stats_window" in payload
+    assert "eta_min_samples" in payload
 
 
 def test_list_jobs_endpoint() -> None:
@@ -70,5 +73,12 @@ def test_subtitle_missing_job_returns_not_found() -> None:
 def test_create_job_rejects_invalid_extension() -> None:
     files = {"file": ("notes.txt", b"hello", "text/plain")}
     data = {"language": "pl", "mode": "fast"}
+    response = request("POST", "/api/jobs", files=files, data=data)
+    assert response.status_code == 400
+
+
+def test_create_job_accepts_auto_language_option() -> None:
+    files = {"file": ("notes.txt", b"hello", "text/plain")}
+    data = {"language": "auto", "mode": "fast"}
     response = request("POST", "/api/jobs", files=files, data=data)
     assert response.status_code == 400

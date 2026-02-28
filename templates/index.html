@@ -65,6 +65,7 @@
               <select id="language" name="language">
                 <option value="pl" selected>Polish</option>
                 <option value="en">English</option>
+                <option value="auto">Auto detect</option>
               </select>
             </label>
 
@@ -241,6 +242,19 @@
         return `${base} (${hint.toLowerCase()})`;
       }
 
+      function formatDetectedLanguage(payload) {
+        const detected = payload && payload.detected_language ? String(payload.detected_language).toUpperCase() : "";
+        if (!detected) {
+          return "";
+        }
+        const probabilityRaw = Number(payload && payload.detected_language_probability);
+        const probability = Number.isFinite(probabilityRaw) ? Math.round(Math.max(0, Math.min(1, probabilityRaw)) * 100) : null;
+        if (probability === null) {
+          return `Detected language: ${detected}`;
+        }
+        return `Detected language: ${detected} (${probability}%)`;
+      }
+
       function updateProgressMeta(payload = null) {
         if (payload && Number.isFinite(Number(payload.created_at)) && Number(payload.created_at) > 0) {
           activeJobCreatedAtMs = Number(payload.created_at) * 1000;
@@ -266,6 +280,15 @@
           const queueHint = formatQueueHint(payload);
           if (queueHint) {
             text += ` • ${queueHint}`;
+          }
+
+          const estimatedTotalRaw = Number(payload.estimated_total_seconds);
+          if (Number.isFinite(estimatedTotalRaw) && estimatedTotalRaw > 0) {
+            if (payload.state === "queued") {
+              text += ` • Queue ETA: ${formatDuration(estimatedTotalRaw)}`;
+            } else if (payload.state === "processing") {
+              text += ` • Remaining: ${formatDuration(estimatedTotalRaw)}`;
+            }
           }
         }
 
@@ -335,7 +358,7 @@
 
         try {
           const prefs = JSON.parse(raw);
-          if (prefs.language === "pl" || prefs.language === "en") {
+          if (prefs.language === "pl" || prefs.language === "en" || prefs.language === "auto") {
             languageSelect.value = prefs.language;
           }
           if (prefs.mode === "fast" || prefs.mode === "accurate") {
@@ -434,9 +457,11 @@
       }
 
       function readyStatusMessage(payload) {
-        return payload && (payload.has_subtitles || payload.subtitle_srt)
+        const base = payload && (payload.has_subtitles || payload.subtitle_srt)
           ? "Done. You can download both .txt and .srt files."
           : "Done. You can download the result as .txt.";
+        const detectedText = formatDetectedLanguage(payload);
+        return detectedText ? `${base} ${detectedText}.` : base;
       }
 
       async function waitForJobByPolling(jobId) {
@@ -624,7 +649,10 @@
           const queueHint = formatQueueHint(job);
           const subtitlesTag = job.has_subtitles ? " • SRT" : "";
           const outputTag = job.output_format === "txt_srt" ? "txt+srt" : "txt";
-          meta.textContent = `${formatDate(job.created_at)} • ${job.language.toUpperCase()} • ${job.mode} • ${outputTag}${subtitlesTag}${queueHint ? ` • ${queueHint}` : ""}`;
+          const detectedTag = job.detected_language
+            ? ` • detected ${String(job.detected_language).toUpperCase()}`
+            : "";
+          meta.textContent = `${formatDate(job.created_at)} • ${job.language.toUpperCase()} • ${job.mode} • ${outputTag}${subtitlesTag}${detectedTag}${queueHint ? ` • ${queueHint}` : ""}`;
 
           const msg = document.createElement("p");
           msg.className = "job-msg";
@@ -640,7 +668,11 @@
               try {
                 const result = await fetchJobResult(job.job_id);
                 applyJobResult(job.job_id, result);
-                setStatus("Loaded result from history.", "success");
+                const detectedText = formatDetectedLanguage(result);
+                setStatus(
+                  detectedText ? `Loaded result from history. ${detectedText}.` : "Loaded result from history.",
+                  "success"
+                );
                 activeJobCreatedAtMs = Number(job.created_at) * 1000 || null;
                 latestProgressValue = 100;
                 updateProgressMeta(job);
