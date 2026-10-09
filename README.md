@@ -3,6 +3,7 @@
 Self-hosted web app that turns `.mp4` / `.mov` / `.mkv` recordings into text and `.srt` subtitles with a local Whisper model, so no audio leaves your machine.
 
 [![CI](https://github.com/MaciejZiel/clip_to_text/actions/workflows/ci.yml/badge.svg)](https://github.com/MaciejZiel/clip_to_text/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/MaciejZiel/clip_to_text/actions/workflows/codeql.yml/badge.svg?branch=master)](https://github.com/MaciejZiel/clip_to_text/actions/workflows/codeql.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white)
 ![FastAPI](https://img.shields.io/badge/FastAPI-009688?logo=fastapi&logoColor=white)
@@ -121,7 +122,7 @@ pip install -r requirements.txt -r requirements-dev.txt
 pytest -q
 ```
 
-8 API smoke tests run against the ASGI app in-process with HTTPX (home page, `/health` shape, job listing, 404s for unknown jobs, rejection of invalid uploads, accepted `language=auto`). They don't download a model, so they run in about a second. CI runs them on Python 3.10 and 3.12 for every push and pull request.
+13 tests run against the ASGI app in-process with HTTPX. 8 API smoke tests cover the home page, the `/health` shape, job listing, 404s for unknown jobs, rejection of invalid uploads and `language=auto`; 5 job-flow tests replace ffmpeg and Whisper with fakes and cover a full job with `.txt`/`.srt` downloads and SSE events, a transcript cache hit, a failed transcription and the SRT helpers. They don't download a model, so they run in about a second. CI runs them on Python 3.10 and 3.12 for every push and pull request, and CodeQL scans the Python code and the page script.
 
 ## Key technical decisions
 
@@ -136,7 +137,6 @@ pytest -q
 - Cancellation is cooperative and takes effect between Whisper segments, not mid-segment.
 - No authentication; it is meant for local or trusted-network use.
 - The test suite covers the HTTP layer; the transcription pipeline (ffmpeg + model) is not exercised in CI.
-- `app/main.py` holds the whole backend (about 1,900 lines); splitting it into storage, worker and API modules is the next refactor.
 
 ## License
 
