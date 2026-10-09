@@ -1330,11 +1330,9 @@ def shutdown_workers() -> None:
 @app.get("/", response_class=HTMLResponse)
 async def home(request: Request) -> HTMLResponse:
     return templates.TemplateResponse(
+        request,
         "index.html",
-        {
-            "request": request,
-            "max_upload_mb": MAX_UPLOAD_MB,
-        },
+        {"max_upload_mb": MAX_UPLOAD_MB},
     )
 
 
