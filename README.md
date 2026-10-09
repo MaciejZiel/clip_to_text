@@ -123,3 +123,6 @@ pytest -q
 - no audio track,
 - missing `ffmpeg`/`ffprobe`,
 - missing `faster-whisper`.
+
+## License
+MIT License, see [LICENSE](LICENSE).
