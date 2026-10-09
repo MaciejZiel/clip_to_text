@@ -5,6 +5,7 @@ Web application for local video-to-text transcription:
 - extract audio with `ffmpeg`,
 - transcribe locally with `faster-whisper`,
 - choose output format: `txt` or `txt + srt`,
+- choose language: `pl`, `en`, or `auto` (auto-detect),
 - live progress (SSE + polling fallback),
 - heartbeat SSE for long-running jobs,
 - persistent job history in SQLite,
@@ -42,7 +43,7 @@ App URL: `http://127.0.0.1:8000`
 - `GET /api/jobs/{job_id}` - get job status
 - `GET /api/jobs/{job_id}/events` - SSE status stream
 - `POST /api/jobs/{job_id}/cancel` - cancel a job
-- `GET /api/jobs/{job_id}/result` - get result as JSON
+- `GET /api/jobs/{job_id}/result` - get result as JSON (includes optional detected language metadata)
 - `GET /api/jobs/{job_id}/subtitle` - get SRT subtitles as plain text
 - `GET /api/jobs/{job_id}/download?format=txt|srt` - download `.txt` or `.srt`
 - `POST /api/transcribe` - simple sync mode (no job history), supports `output_format=txt|txt_srt`
@@ -79,13 +80,19 @@ App URL: `http://127.0.0.1:8000`
 - `SSE_HEARTBEAT_SECONDS` (default: `12`)
 - `MAINTENANCE_INTERVAL_SECONDS` (default: `300`)
 
+- `ETA_STATS_WINDOW` (default: `120`, number of recent completed jobs used for ETA)
+- `ETA_MIN_SAMPLES` (default: `3`, minimum samples required to show ETA)
+- `ETA_CACHE_TTL_SECONDS` (default: `30`)
+
 - `FFMPEG_BIN` (default: `ffmpeg`)
 - `FFPROBE_BIN` (default: `ffprobe`)
 - `FFMPEG_THREADS` (default: `0`, auto)
 - `LOG_LEVEL` (default: `INFO`)
 
 ## Quick Performance Profiles
-Note: when `output_format=txt_srt` is selected, timestamps are enabled and processing is usually slower than plain `txt`.
+Notes:
+- when `output_format=txt_srt` is selected, timestamps are enabled and processing is usually slower than plain `txt`.
+- ETA values are heuristic and become better after enough completed jobs exist in history.
 
 CPU (higher throughput):
 ```bash

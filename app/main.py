@@ -12,6 +12,7 @@ import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from hashlib import sha256
+from math import ceil
 from pathlib import Path
 from threading import Event, Lock, RLock, Thread
 from typing import Any, Callable, Literal
@@ -85,6 +86,10 @@ FFMPEG_THREADS = max(0, int(os.getenv("FFMPEG_THREADS", "0")))
 FFMPEG_AVAILABLE = shutil.which(FFMPEG_BIN) is not None
 FFPROBE_AVAILABLE = shutil.which(FFPROBE_BIN) is not None
 
+ETA_STATS_WINDOW = max(10, int(os.getenv("ETA_STATS_WINDOW", "120")))
+ETA_MIN_SAMPLES = max(1, int(os.getenv("ETA_MIN_SAMPLES", "3")))
+ETA_CACHE_TTL_SECONDS = max(5, int(os.getenv("ETA_CACHE_TTL_SECONDS", "30")))
+
 WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "auto")
 WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
 WHISPER_CPU_THREADS = max(0, int(os.getenv("WHISPER_CPU_THREADS", "0")))
@@ -111,6 +116,7 @@ MODE_CONFIG: dict[str, dict[str, Any]] = {
 }
 
 JobState = Literal["queued", "processing", "done", "error"]
+LanguageOption = Literal["pl", "en", "auto"]
 OutputFormat = Literal["txt", "txt_srt"]
 logger = logging.getLogger("clip_to_text")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -158,6 +164,8 @@ class UploadMetadata:
 class CachedTranscript:
     transcript: str
     subtitle_srt: str | None
+    detected_language: str | None
+    detected_language_probability: float | None
     created_at: float
 
 
@@ -165,7 +173,7 @@ class CachedTranscript:
 class TranscriptionJob:
     id: str
     filename: str
-    language: Literal["pl", "en"]
+    language: LanguageOption
     mode: Literal["fast", "accurate"]
     output_format: OutputFormat
     tmp_dir: Path
@@ -179,6 +187,8 @@ class TranscriptionJob:
     message: str = "File uploaded. Job is queued."
     transcript: str | None = None
     subtitle_srt: str | None = None
+    detected_language: str | None = None
+    detected_language_probability: float | None = None
     error: str | None = None
     content_hash: str | None = None
     completed_at: float | None = None
@@ -189,6 +199,8 @@ class TranscriptionResponse(BaseModel):
     filename: str
     subtitle_srt: str | None = None
     has_subtitles: bool = False
+    detected_language: str | None = None
+    detected_language_probability: float | None = None
 
 
 class JobStartResponse(BaseModel):
@@ -198,7 +210,7 @@ class JobStartResponse(BaseModel):
 class JobStatusResponse(BaseModel):
     job_id: str
     filename: str
-    language: Literal["pl", "en"]
+    language: LanguageOption
     mode: Literal["fast", "accurate"]
     output_format: OutputFormat
     state: JobState
@@ -207,8 +219,12 @@ class JobStatusResponse(BaseModel):
     message: str
     ready: bool
     has_subtitles: bool
+    detected_language: str | None = None
+    detected_language_probability: float | None = None
     queue_position: int | None = None
     queue_size: int = 0
+    estimated_wait_seconds: float | None = None
+    estimated_total_seconds: float | None = None
     created_at: float
     updated_at: float
     error: str | None = None
@@ -217,7 +233,7 @@ class JobStatusResponse(BaseModel):
 class JobSummary(BaseModel):
     job_id: str
     filename: str
-    language: Literal["pl", "en"]
+    language: LanguageOption
     mode: Literal["fast", "accurate"]
     output_format: OutputFormat
     state: JobState
@@ -225,8 +241,12 @@ class JobSummary(BaseModel):
     progress: float
     message: str
     has_subtitles: bool
+    detected_language: str | None = None
+    detected_language_probability: float | None = None
     queue_position: int | None = None
     queue_size: int = 0
+    estimated_wait_seconds: float | None = None
+    estimated_total_seconds: float | None = None
     created_at: float
     updated_at: float
     error: str | None = None
@@ -262,6 +282,17 @@ _MAINTENANCE_THREAD: Thread | None = None
 
 _DB_CONNECTION: sqlite3.Connection | None = None
 _DB_LOCK = RLock()
+
+
+@dataclass
+class EtaStats:
+    average_runtime_seconds: float
+    samples: int
+    created_at: float
+
+
+_ETA_CACHE: dict[tuple[str, str, str], EtaStats] = {}
+_ETA_CACHE_LOCK = Lock()
 
 
 def _db_conn() -> sqlite3.Connection:
@@ -316,6 +347,8 @@ def _init_db() -> None:
             message TEXT NOT NULL,
             transcript TEXT,
             subtitle_srt TEXT,
+            detected_language TEXT,
+            detected_language_probability REAL,
             error TEXT,
             content_hash TEXT,
             video_path TEXT,
@@ -332,16 +365,25 @@ def _init_db() -> None:
             cache_key TEXT PRIMARY KEY,
             transcript TEXT NOT NULL,
             subtitle_srt TEXT,
+            detected_language TEXT,
+            detected_language_probability REAL,
             created_at REAL NOT NULL
         )
         """
     )
     _ensure_table_column("jobs", "output_format", "TEXT NOT NULL DEFAULT 'txt'")
     _ensure_table_column("jobs", "subtitle_srt", "TEXT")
+    _ensure_table_column("jobs", "detected_language", "TEXT")
+    _ensure_table_column("jobs", "detected_language_probability", "REAL")
     _ensure_table_column("transcript_cache", "subtitle_srt", "TEXT")
+    _ensure_table_column("transcript_cache", "detected_language", "TEXT")
+    _ensure_table_column("transcript_cache", "detected_language_probability", "REAL")
     _db_execute("CREATE INDEX IF NOT EXISTS idx_jobs_created_at ON jobs(created_at DESC)")
     _db_execute("CREATE INDEX IF NOT EXISTS idx_jobs_state ON jobs(state)")
     _db_execute("CREATE INDEX IF NOT EXISTS idx_jobs_completed_at ON jobs(completed_at)")
+    _db_execute(
+        "CREATE INDEX IF NOT EXISTS idx_jobs_profile ON jobs(mode, output_format, language, state, completed_at DESC)"
+    )
 
 
 def _close_db() -> None:
@@ -567,12 +609,12 @@ def _raise_if_cancelled(job_id: str) -> None:
 
 def _transcribe_audio(
     audio_path: Path,
-    language: Literal["pl", "en"],
+    language: LanguageOption,
     mode: Literal["fast", "accurate"],
     output_format: OutputFormat,
     progress_callback: Callable[[float, str], None] | None = None,
     cancel_callback: Callable[[], None] | None = None,
-) -> tuple[str, str | None]:
+) -> tuple[str, str | None, str | None, float | None]:
     if cancel_callback is not None:
         cancel_callback()
 
@@ -583,7 +625,7 @@ def _transcribe_audio(
     config = MODE_CONFIG[mode]
 
     transcribe_kwargs = {
-        "language": language,
+        "language": None if language == "auto" else language,
         "beam_size": int(config["beam_size"]),
         "best_of": int(config["best_of"]),
         "vad_filter": bool(config["vad_filter"]),
@@ -645,8 +687,19 @@ def _transcribe_audio(
         raise TranscriptionRuntimeError(
             "Transcription returned an empty result. Check audio quality in the file."
         )
+
+    detected_language_raw = getattr(info, "language", None)
+    detected_language = str(detected_language_raw) if detected_language_raw else None
+    detected_probability_raw = getattr(info, "language_probability", None)
+    detected_probability: float | None = None
+    if detected_probability_raw is not None:
+        try:
+            detected_probability = max(0.0, min(1.0, float(detected_probability_raw)))
+        except (TypeError, ValueError):
+            detected_probability = None
+
     subtitle_srt = _build_srt(subtitle_segments) if output_format == "txt_srt" else None
-    return transcript, subtitle_srt
+    return transcript, subtitle_srt, detected_language, detected_probability
 
 
 def _normalize_transcript(text: str) -> str:
@@ -722,11 +775,12 @@ def _row_to_job(row: sqlite3.Row) -> TranscriptionJob:
     audio_path = Path(row["audio_path"]) if row["audio_path"] else Path("")
     tmp_dir = video_path.parent if row["video_path"] else Path("")
     output_format: OutputFormat = "txt_srt" if row["output_format"] == "txt_srt" else "txt"
+    language: LanguageOption = "auto" if row["language"] == "auto" else ("en" if row["language"] == "en" else "pl")
 
     return TranscriptionJob(
         id=row["id"],
         filename=row["filename"],
-        language=row["language"],
+        language=language,
         mode=row["mode"],
         output_format=output_format,
         tmp_dir=tmp_dir,
@@ -740,6 +794,8 @@ def _row_to_job(row: sqlite3.Row) -> TranscriptionJob:
         message=row["message"],
         transcript=row["transcript"],
         subtitle_srt=row["subtitle_srt"],
+        detected_language=row["detected_language"],
+        detected_language_probability=row["detected_language_probability"],
         error=row["error"],
         content_hash=row["content_hash"],
         completed_at=row["completed_at"],
@@ -751,9 +807,9 @@ def _upsert_job(job: TranscriptionJob) -> None:
         """
         INSERT INTO jobs (
             id, filename, language, mode, output_format, state, stage, progress, message,
-            transcript, subtitle_srt, error, content_hash, video_path, audio_path,
+            transcript, subtitle_srt, detected_language, detected_language_probability, error, content_hash, video_path, audio_path,
             created_at, updated_at, completed_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
             filename=excluded.filename,
             language=excluded.language,
@@ -765,6 +821,8 @@ def _upsert_job(job: TranscriptionJob) -> None:
             message=excluded.message,
             transcript=excluded.transcript,
             subtitle_srt=excluded.subtitle_srt,
+            detected_language=excluded.detected_language,
+            detected_language_probability=excluded.detected_language_probability,
             error=excluded.error,
             content_hash=excluded.content_hash,
             video_path=excluded.video_path,
@@ -784,6 +842,8 @@ def _upsert_job(job: TranscriptionJob) -> None:
             job.message,
             job.transcript,
             job.subtitle_srt,
+            job.detected_language,
+            job.detected_language_probability,
             job.error,
             job.content_hash,
             str(job.video_path) if str(job.video_path) else None,
@@ -811,6 +871,8 @@ def _update_job(
     message: str | None = None,
     transcript: str | None = None,
     subtitle_srt: str | None = None,
+    detected_language: str | None = None,
+    detected_language_probability: float | None = None,
     error: str | None = None,
 ) -> None:
     now = time.time()
@@ -835,6 +897,10 @@ def _update_job(
         job.transcript = transcript
     if subtitle_srt is not None:
         job.subtitle_srt = subtitle_srt
+    if detected_language is not None:
+        job.detected_language = detected_language
+    if detected_language_probability is not None:
+        job.detected_language_probability = detected_language_probability
     job.error = error
     job.updated_at = now
 
@@ -845,6 +911,10 @@ def _update_job(
         _JOBS[job_id] = job
 
     _upsert_job(job)
+
+    if job.state == "done":
+        with _ETA_CACHE_LOCK:
+            _ETA_CACHE.clear()
 
 
 def _get_job_snapshot(job_id: str) -> TranscriptionJob | None:
@@ -881,8 +951,104 @@ def _active_jobs_count() -> int:
         return sum(1 for job in _JOBS.values() if job.state in {"queued", "processing"})
 
 
+def _estimate_runtime_for_profile(mode: str, output_format: str, language: str | None) -> EtaStats | None:
+    normalized_language = language if language is not None else "*"
+    cache_key = (mode, output_format, normalized_language)
+    now = time.time()
+
+    with _ETA_CACHE_LOCK:
+        cached = _ETA_CACHE.get(cache_key)
+        if cached is not None and now - cached.created_at <= ETA_CACHE_TTL_SECONDS:
+            return cached
+
+    if language is None:
+        row = _db_fetchone(
+            """
+            SELECT AVG(completed_at - created_at) AS avg_runtime, COUNT(1) AS samples
+            FROM (
+                SELECT created_at, completed_at
+                FROM jobs
+                WHERE state = 'done'
+                  AND completed_at IS NOT NULL
+                  AND created_at IS NOT NULL
+                  AND mode = ?
+                  AND output_format = ?
+                ORDER BY completed_at DESC
+                LIMIT ?
+            )
+            """,
+            (mode, output_format, ETA_STATS_WINDOW),
+        )
+    else:
+        row = _db_fetchone(
+            """
+            SELECT AVG(completed_at - created_at) AS avg_runtime, COUNT(1) AS samples
+            FROM (
+                SELECT created_at, completed_at
+                FROM jobs
+                WHERE state = 'done'
+                  AND completed_at IS NOT NULL
+                  AND created_at IS NOT NULL
+                  AND mode = ?
+                  AND output_format = ?
+                  AND language = ?
+                ORDER BY completed_at DESC
+                LIMIT ?
+            )
+            """,
+            (mode, output_format, language, ETA_STATS_WINDOW),
+        )
+    if row is None or row["avg_runtime"] is None:
+        return None
+
+    samples = int(row["samples"] or 0)
+    if samples < ETA_MIN_SAMPLES:
+        return None
+
+    avg_runtime = max(1.0, float(row["avg_runtime"]))
+    stats = EtaStats(average_runtime_seconds=avg_runtime, samples=samples, created_at=now)
+    with _ETA_CACHE_LOCK:
+        _ETA_CACHE[cache_key] = stats
+    return stats
+
+
+def _get_eta_stats(mode: str, output_format: str, language: LanguageOption) -> EtaStats | None:
+    preferred = _estimate_runtime_for_profile(mode, output_format, language)
+    if preferred is not None:
+        return preferred
+    return _estimate_runtime_for_profile(mode, output_format, None)
+
+
+def _estimate_eta_seconds(
+    job: TranscriptionJob,
+    queue_position: int | None,
+) -> tuple[float | None, float | None]:
+    stats = _get_eta_stats(job.mode, job.output_format, job.language)
+    if stats is None:
+        return None, None
+
+    per_job_seconds = stats.average_runtime_seconds
+    wait_seconds = 0.0
+
+    if job.state == "queued" and queue_position is not None and queue_position > 1:
+        jobs_ahead = queue_position - 1
+        waves = ceil(jobs_ahead / max(1, TRANSCRIBE_WORKERS))
+        wait_seconds = max(0.0, waves * per_job_seconds)
+
+    if job.state == "queued":
+        total_seconds = wait_seconds + per_job_seconds
+        return round(wait_seconds, 1), round(total_seconds, 1)
+
+    if job.state == "processing":
+        remaining = max(0.0, (100.0 - job.progress) / 100.0 * per_job_seconds)
+        return 0.0, round(remaining, 1)
+
+    return 0.0, 0.0
+
+
 def _build_job_status(job: TranscriptionJob) -> JobStatusResponse:
     queue_position, queue_size = _queue_stats(job.id)
+    estimated_wait_seconds, estimated_total_seconds = _estimate_eta_seconds(job, queue_position)
     return JobStatusResponse(
         job_id=job.id,
         filename=job.filename,
@@ -895,8 +1061,12 @@ def _build_job_status(job: TranscriptionJob) -> JobStatusResponse:
         message=job.message,
         ready=job.state == "done",
         has_subtitles=bool(job.subtitle_srt),
+        detected_language=job.detected_language,
+        detected_language_probability=job.detected_language_probability,
         queue_position=queue_position,
         queue_size=queue_size,
+        estimated_wait_seconds=estimated_wait_seconds,
+        estimated_total_seconds=estimated_total_seconds,
         created_at=job.created_at,
         updated_at=job.updated_at,
         error=job.error,
@@ -905,6 +1075,7 @@ def _build_job_status(job: TranscriptionJob) -> JobStatusResponse:
 
 def _build_job_summary(job: TranscriptionJob) -> JobSummary:
     queue_position, queue_size = _queue_stats(job.id)
+    estimated_wait_seconds, estimated_total_seconds = _estimate_eta_seconds(job, queue_position)
     return JobSummary(
         job_id=job.id,
         filename=job.filename,
@@ -916,8 +1087,12 @@ def _build_job_summary(job: TranscriptionJob) -> JobSummary:
         progress=round(job.progress, 1),
         message=job.message,
         has_subtitles=bool(job.subtitle_srt),
+        detected_language=job.detected_language,
+        detected_language_probability=job.detected_language_probability,
         queue_position=queue_position,
         queue_size=queue_size,
+        estimated_wait_seconds=estimated_wait_seconds,
+        estimated_total_seconds=estimated_total_seconds,
         created_at=job.created_at,
         updated_at=job.updated_at,
         error=job.error,
@@ -926,7 +1101,7 @@ def _build_job_summary(job: TranscriptionJob) -> JobSummary:
 
 def _transcript_cache_key(
     content_hash: str,
-    language: Literal["pl", "en"],
+    language: LanguageOption,
     mode: Literal["fast", "accurate"],
     output_format: OutputFormat,
 ) -> tuple[str, str, str, str, str, str, str]:
@@ -980,7 +1155,7 @@ def _cleanup_transcript_cache() -> None:
 
 def _get_cached_transcript(
     content_hash: str,
-    language: Literal["pl", "en"],
+    language: LanguageOption,
     mode: Literal["fast", "accurate"],
     output_format: OutputFormat,
 ) -> CachedTranscript | None:
@@ -995,7 +1170,11 @@ def _get_cached_transcript(
             return cached
 
     row = _db_fetchone(
-        "SELECT transcript, subtitle_srt, created_at FROM transcript_cache WHERE cache_key = ?",
+        """
+        SELECT transcript, subtitle_srt, detected_language, detected_language_probability, created_at
+        FROM transcript_cache
+        WHERE cache_key = ?
+        """,
         (json.dumps(cache_key),),
     )
     if row is None:
@@ -1008,6 +1187,8 @@ def _get_cached_transcript(
     cached = CachedTranscript(
         transcript=str(row["transcript"]),
         subtitle_srt=row["subtitle_srt"],
+        detected_language=row["detected_language"],
+        detected_language_probability=row["detected_language_probability"],
         created_at=float(row["created_at"]),
     )
     with _TRANSCRIPT_CACHE_LOCK:
@@ -1017,11 +1198,13 @@ def _get_cached_transcript(
 
 def _set_cached_transcript(
     content_hash: str | None,
-    language: Literal["pl", "en"],
+    language: LanguageOption,
     mode: Literal["fast", "accurate"],
     output_format: OutputFormat,
     transcript: str,
     subtitle_srt: str | None,
+    detected_language: str | None,
+    detected_language_probability: float | None,
 ) -> None:
     if not content_hash or TRANSCRIPT_CACHE_TTL_SECONDS <= 0:
         return
@@ -1033,20 +1216,33 @@ def _set_cached_transcript(
         _TRANSCRIPT_CACHE[cache_key] = CachedTranscript(
             transcript=transcript,
             subtitle_srt=subtitle_srt,
+            detected_language=detected_language,
+            detected_language_probability=detected_language_probability,
             created_at=now,
         )
 
     serialized_key = json.dumps(cache_key)
     _db_execute(
         """
-        INSERT INTO transcript_cache (cache_key, transcript, subtitle_srt, created_at)
-        VALUES (?, ?, ?, ?)
+        INSERT INTO transcript_cache (
+            cache_key, transcript, subtitle_srt, detected_language, detected_language_probability, created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?)
         ON CONFLICT(cache_key) DO UPDATE SET
             transcript=excluded.transcript,
             subtitle_srt=excluded.subtitle_srt,
+            detected_language=excluded.detected_language,
+            detected_language_probability=excluded.detected_language_probability,
             created_at=excluded.created_at
         """,
-        (serialized_key, transcript, subtitle_srt, now),
+        (
+            serialized_key,
+            transcript,
+            subtitle_srt,
+            detected_language,
+            detected_language_probability,
+            now,
+        ),
     )
 
 
@@ -1179,7 +1375,7 @@ def _run_transcription_job(job_id: str) -> None:
                 error=None,
             )
 
-        transcript, subtitle_srt = _transcribe_audio(
+        transcript, subtitle_srt, detected_language, detected_probability = _transcribe_audio(
             job.audio_path,
             job.language,
             job.mode,
@@ -1195,6 +1391,8 @@ def _run_transcription_job(job_id: str) -> None:
             job.output_format,
             transcript,
             subtitle_srt,
+            detected_language,
+            detected_probability,
         )
         _update_job(
             job_id,
@@ -1204,6 +1402,8 @@ def _run_transcription_job(job_id: str) -> None:
             message="Done.",
             transcript=transcript,
             subtitle_srt=subtitle_srt,
+            detected_language=detected_language,
+            detected_language_probability=detected_probability,
             error=None,
         )
         logger.info("Job %s finished successfully", job_id)
@@ -1255,10 +1455,10 @@ def _run_transcription_job(job_id: str) -> None:
 
 def _process_upload(
     upload: UploadFile,
-    language: Literal["pl", "en"],
+    language: LanguageOption,
     mode: Literal["fast", "accurate"],
     output_format: OutputFormat,
-) -> tuple[str, str | None]:
+) -> tuple[str, str | None, str | None, float | None]:
     if not upload.filename:
         raise InvalidFileTypeError("Missing filename.")
 
@@ -1274,11 +1474,21 @@ def _process_upload(
         _probe_duration_seconds(video_path)
         cached_result = _get_cached_transcript(metadata.content_hash, language, mode, output_format)
         if cached_result is not None:
-            return cached_result.transcript, cached_result.subtitle_srt
+            return (
+                cached_result.transcript,
+                cached_result.subtitle_srt,
+                cached_result.detected_language,
+                cached_result.detected_language_probability,
+            )
 
         _extract_audio_to_wav(video_path, audio_path)
 
-        transcript, subtitle_srt = _transcribe_audio(audio_path, language, mode, output_format)
+        transcript, subtitle_srt, detected_language, detected_probability = _transcribe_audio(
+            audio_path,
+            language,
+            mode,
+            output_format,
+        )
         _set_cached_transcript(
             metadata.content_hash,
             language,
@@ -1286,8 +1496,10 @@ def _process_upload(
             output_format,
             transcript,
             subtitle_srt,
+            detected_language,
+            detected_probability,
         )
-        return transcript, subtitle_srt
+        return transcript, subtitle_srt, detected_language, detected_probability
 
 
 def _serialize_model(model: BaseModel) -> dict[str, Any]:
@@ -1351,7 +1563,7 @@ async def list_jobs(limit: int = Query(12, ge=1, le=100)) -> JobsListResponse:
 @app.post("/api/jobs", response_model=JobStartResponse, status_code=status.HTTP_202_ACCEPTED)
 async def create_job(
     file: UploadFile = File(...),
-    language: Literal["pl", "en"] = Form("pl"),
+    language: LanguageOption = Form("pl"),
     mode: Literal["fast", "accurate"] = Form("fast"),
     output_format: OutputFormat = Form("txt"),
 ) -> JobStartResponse:
@@ -1438,6 +1650,8 @@ async def create_job(
             message="Done (cache hit).",
             transcript=cached_result.transcript,
             subtitle_srt=cached_result.subtitle_srt,
+            detected_language=cached_result.detected_language,
+            detected_language_probability=cached_result.detected_language_probability,
             error=None,
             content_hash=metadata.content_hash,
             completed_at=now,
@@ -1616,6 +1830,8 @@ async def get_job_result(job_id: str) -> TranscriptionResponse:
         filename=job.filename,
         subtitle_srt=job.subtitle_srt,
         has_subtitles=bool(job.subtitle_srt),
+        detected_language=job.detected_language,
+        detected_language_probability=job.detected_language_probability,
     )
 
 
@@ -1652,14 +1868,14 @@ async def get_job_subtitle(job_id: str) -> PlainTextResponse:
 @app.post("/api/transcribe", response_model=TranscriptionResponse)
 async def transcribe(
     file: UploadFile = File(...),
-    language: Literal["pl", "en"] = Form("pl"),
+    language: LanguageOption = Form("pl"),
     mode: Literal["fast", "accurate"] = Form("fast"),
     output_format: OutputFormat = Form("txt"),
 ) -> TranscriptionResponse:
     safe_name = _safe_filename_stem(file.filename or "transcription")
 
     try:
-        transcript, subtitle_srt = await run_in_threadpool(
+        transcript, subtitle_srt, detected_language, detected_probability = await run_in_threadpool(
             _process_upload,
             file,
             language,
@@ -1690,6 +1906,8 @@ async def transcribe(
         filename=safe_name,
         subtitle_srt=subtitle_srt,
         has_subtitles=bool(subtitle_srt),
+        detected_language=detected_language,
+        detected_language_probability=detected_probability,
     )
 
 
@@ -1704,6 +1922,8 @@ async def health() -> dict[str, Any]:
 
     with _TRANSCRIPT_CACHE_LOCK:
         cache_size = len(_TRANSCRIPT_CACHE)
+    with _ETA_CACHE_LOCK:
+        eta_cache_entries = len(_ETA_CACHE)
 
     db_row = _db_fetchone("SELECT COUNT(1) AS count FROM jobs")
     persisted_jobs = int(db_row["count"]) if db_row else 0
@@ -1720,4 +1940,7 @@ async def health() -> dict[str, Any]:
         "max_pending_jobs": MAX_PENDING_JOBS,
         "ffmpeg_available": FFMPEG_AVAILABLE,
         "ffprobe_available": FFPROBE_AVAILABLE,
+        "eta_cache_entries": eta_cache_entries,
+        "eta_stats_window": ETA_STATS_WINDOW,
+        "eta_min_samples": ETA_MIN_SAMPLES,
     }
