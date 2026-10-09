@@ -1,0 +1,7 @@
+# Third-party licenses
+
+| source | name | license type | license link |
+| --- | --- | --- | --- |
+| https://github.com/PyAV-Org/PyAV | av (PyAV) | BSD-3-Clause | https://github.com/PyAV-Org/PyAV/blob/master/LICENSE.txt |
+| https://github.com/actions/checkout | actions/checkout (CI only) | MIT | https://github.com/actions/checkout/blob/main/LICENSE |
+| https://github.com/actions/setup-python | actions/setup-python (CI only) | MIT | https://github.com/actions/setup-python/blob/main/LICENSE |

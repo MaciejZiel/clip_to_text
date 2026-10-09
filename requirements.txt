@@ -3,3 +3,6 @@ uvicorn[standard]>=0.30.0
 python-multipart>=0.0.9
 jinja2>=3.1.4
 faster-whisper>=1.1.0
+# PyAV 19 removed the metadata_errors argument that faster-whisper 1.2.1
+# passes to av.open(), so every transcription failed with a TypeError.
+av>=11,<19
