@@ -5,3 +5,6 @@ __pycache__/
 .pytest_cache/
 *.sqlite3-wal
 *.sqlite3-shm
+
+# Runtime job database (created automatically on startup)
+data/*.sqlite3
