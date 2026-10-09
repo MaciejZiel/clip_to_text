@@ -3,6 +3,7 @@
 Self-hosted web app that turns `.mp4` / `.mov` / `.mkv` recordings into text and `.srt` subtitles with a local Whisper model, so no audio leaves your machine.
 
 [![CI](https://github.com/MaciejZiel/clip_to_text/actions/workflows/ci.yml/badge.svg)](https://github.com/MaciejZiel/clip_to_text/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/MaciejZiel/clip_to_text/actions/workflows/codeql.yml/badge.svg?branch=master)](https://github.com/MaciejZiel/clip_to_text/actions/workflows/codeql.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white)
 ![FastAPI](https://img.shields.io/badge/FastAPI-009688?logo=fastapi&logoColor=white)
