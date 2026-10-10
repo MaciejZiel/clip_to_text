@@ -7,3 +7,4 @@
 | https://github.com/actions/setup-python | actions/setup-python v7.0.0 (CI only) | MIT | https://github.com/actions/setup-python/blob/main/LICENSE |
 | https://github.com/github/codeql-action | github/codeql-action v4.38.2 (CI only) | MIT | https://github.com/github/codeql-action/blob/main/LICENSE |
 | https://github.com/fastapi/fastapi | fastapi 0.141.1 | MIT | https://github.com/fastapi/fastapi/blob/master/LICENSE |
+| https://github.com/encode/httpx | httpx 0.28.1 | BSD-3-Clause | https://github.com/encode/httpx/blob/master/LICENSE.md |
