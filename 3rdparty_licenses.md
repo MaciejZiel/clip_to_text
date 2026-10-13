@@ -12,3 +12,4 @@
 | https://github.com/pytest-dev/pytest | pytest 9.1.1 | MIT | https://github.com/pytest-dev/pytest/blob/main/LICENSE |
 | https://github.com/pallets/jinja | Jinja2 3.1.6 | BSD-3-Clause | https://github.com/pallets/jinja/blob/main/LICENSE.txt |
 | https://github.com/SYSTRAN/faster-whisper | faster-whisper 1.2.1 | MIT | https://github.com/SYSTRAN/faster-whisper/blob/master/LICENSE |
+| https://github.com/Kludex/python-multipart | python-multipart 0.0.32 | Apache-2.0 | https://github.com/Kludex/python-multipart/blob/master/LICENSE.txt |
