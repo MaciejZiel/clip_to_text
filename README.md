@@ -1,18 +1,28 @@
-# Clip to Text Pro
+<p align="center">
+  <img src="docs/logo.svg" width="72" height="72" alt="Clip to Text Pro logo">
+</p>
 
-Self-hosted web app that turns `.mp4` / `.mov` / `.mkv` recordings into text and `.srt` subtitles with a local Whisper model, so no audio leaves your machine.
+<h1 align="center">Clip to Text Pro</h1>
 
-[![CI](https://github.com/MaciejZiel/clip_to_text/actions/workflows/ci.yml/badge.svg)](https://github.com/MaciejZiel/clip_to_text/actions/workflows/ci.yml)
-[![CodeQL](https://github.com/MaciejZiel/clip_to_text/actions/workflows/codeql.yml/badge.svg?branch=master)](https://github.com/MaciejZiel/clip_to_text/actions/workflows/codeql.yml)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white)
-![FastAPI](https://img.shields.io/badge/FastAPI-009688?logo=fastapi&logoColor=white)
+<p align="center">
+  <b>Self-hosted web app that turns <code>.mp4</code> / <code>.mov</code> / <code>.mkv</code> recordings into text and <code>.srt</code> subtitles with a local Whisper model, so no audio leaves your machine.</b>
+</p>
 
-![Uploading a clip, live progress and the finished transcript](docs/demo.gif)
+<p align="center">
+  <a href="https://github.com/MaciejZiel/clip_to_text/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/MaciejZiel/clip_to_text/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="https://github.com/MaciejZiel/clip_to_text/actions/workflows/codeql.yml"><img alt="CodeQL" src="https://github.com/MaciejZiel/clip_to_text/actions/workflows/codeql.yml/badge.svg?branch=master"></a>
+  <a href="LICENSE"><img alt="Licence: MIT" src="https://img.shields.io/badge/licence-MIT-blue"></a>
+  <img alt="Python 3.10+" src="https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white">
+  <img alt="FastAPI" src="https://img.shields.io/badge/FastAPI-009688?logo=fastapi&logoColor=white">
+</p>
 
-*Real run on a laptop CPU with the `tiny` model: an 11-second clip, language auto-detected, `.txt` and `.srt` ready in about a second.*
+<p align="center">
+  <img src="docs/demo.gif" width="760" alt="Uploading a clip, live progress and the finished transcript">
+</p>
 
-## What it does
+<p align="center"><sub>Real run on a laptop CPU with the <code>tiny</code> model: an 11-second clip, language auto-detected, <code>.txt</code> and <code>.srt</code> ready in about a second.</sub></p>
+
+## ✨ Features
 
 - **Background jobs with live progress.** An upload returns `202 Accepted` with a job id at once; a worker pool extracts audio with `ffmpeg` and transcribes it with `faster-whisper`, while the browser follows the job over Server-Sent Events (heartbeats included) and falls back to polling.
 - **Two profiles, three languages.** "Faster" (`tiny`, greedy decoding) or "More accurate" (`medium`, beam search 5 + VAD); Polish, English or automatic language detection with the detected language and its probability in the result.
@@ -20,9 +30,12 @@ Self-hosted web app that turns `.mp4` / `.mov` / `.mkv` recordings into text and
 - **Remembers work.** Job history lives in SQLite and survives restarts; a transcript cache keyed by the file's SHA-256 and the model settings makes re-uploading the same clip instant.
 - **Defensive by default.** Extension, MIME type and container magic bytes are checked, uploads are size-limited while streaming, the queue returns `429` when full, jobs can be cancelled, and jobs cut off by a restart are marked as interrupted instead of hanging.
 
-![Finished job, download buttons and job history with a cache hit](docs/screenshot.png)
+<p align="center">
+  <img src="docs/screenshot.png" width="760" alt="Finished job, download buttons and job history with a cache hit">
+</p>
 
-## Architecture
+
+## 🧭 Architecture
 
 ```mermaid
 flowchart LR
@@ -37,11 +50,17 @@ flowchart LR
 
 Everything runs in one process: the API thread handles uploads and SSE, a bounded thread pool runs the CPU-heavy work, and loaded Whisper models are cached per profile so only the first job pays the load time.
 
-## Tech stack
+## 🛠 Tech stack
 
-Python 3.10+, FastAPI, Uvicorn, faster-whisper (CTranslate2), ffmpeg/ffprobe, SQLite (WAL), Jinja2, vanilla JavaScript + CSS (light/dark), pytest + HTTPX, GitHub Actions.
+| Layer | Used |
+|---|---|
+| Server | Python 3.10+, FastAPI, Uvicorn |
+| Speech | faster-whisper (CTranslate2), ffmpeg / ffprobe |
+| Storage | SQLite (WAL) |
+| UI | Jinja2, vanilla JavaScript + CSS (light/dark) |
+| Quality | pytest + HTTPX, GitHub Actions |
 
-## Quick start
+## 🚀 Quick start
 
 Requires Python 3.10+ and `ffmpeg` on the `PATH` (`sudo apt-get install ffmpeg` or `brew install ffmpeg`).
 
@@ -115,7 +134,7 @@ export WHISPER_DEVICE=cuda WHISPER_COMPUTE_TYPE=float16 WHISPER_FAST_MODEL=tiny 
 
 </details>
 
-## Tests
+## 🧪 Tests
 
 ```bash
 pip install -r requirements.txt -r requirements-dev.txt
@@ -124,20 +143,20 @@ pytest -q
 
 13 tests run against the ASGI app in-process with HTTPX. 8 API smoke tests cover the home page, the `/health` shape, job listing, 404s for unknown jobs, rejection of invalid uploads and `language=auto`; 5 job-flow tests replace ffmpeg and Whisper with fakes and cover a full job with `.txt`/`.srt` downloads and SSE events, a transcript cache hit, a failed transcription, an upload with the wrong container and the SRT helpers. They don't download a model, so they run in about a second. CI runs them on Python 3.10 and 3.12 for every push and pull request, and CodeQL scans the Python code and the page script.
 
-## Key technical decisions
+## 🧱 Key technical decisions
 
 - **Thread pool instead of Celery/Redis.** Whisper inference releases the GIL inside CTranslate2, so threads give real parallelism and the app stays a single `uvicorn` process with no broker. The cost: jobs don't survive a restart (they are marked as interrupted) and work can't be spread over several machines.
 - **SSE with a polling fallback instead of WebSockets.** Progress only flows server to client, SSE works over plain HTTP and through most proxies, and heartbeats keep long jobs from being cut by idle timeouts. If the stream drops, the UI polls `GET /api/jobs/{id}`.
 - **Content-addressed cache.** The SHA-256 is computed while the upload is streamed to disk, so hashing costs no extra pass. The cache key also includes language, profile, output format, model, device and compute type, so changing any of them can't return a stale transcript.
 - **SQLite for jobs and cache.** One file, WAL mode, no extra service, and history plus ETA statistics come from plain SQL. It fits a single-node tool; several app instances would need Postgres or similar.
 
-## Limitations and next steps
+## 🚧 Limitations and next steps
 
 - Single node only: the queue and loaded models live in one process.
 - Cancellation is cooperative and takes effect between Whisper segments, not mid-segment.
 - No authentication; it is meant for local or trusted-network use.
 - The test suite covers the HTTP layer; the transcription pipeline (ffmpeg + model) is not exercised in CI.
 
-## License
+## 📄 Licence
 
 MIT, see [LICENSE](LICENSE). Third-party components added to this repository are listed in [3rdparty_licenses.md](3rdparty_licenses.md).
