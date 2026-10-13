@@ -34,7 +34,6 @@
   <img src="docs/screenshot.png" width="760" alt="Finished job, download buttons and job history with a cache hit">
 </p>
 
-
 ## 🧭 Architecture
 
 ```mermaid
