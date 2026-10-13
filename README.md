@@ -71,7 +71,7 @@ Open <http://127.0.0.1:8000>. On first start the `tiny` model (about 75 MB) is d
 | `POST` | `/api/transcribe` | Synchronous one-shot mode, no job history |
 | `GET` | `/health` | Health and runtime metrics (queue, cache, ffmpeg availability) |
 
-FastAPI also serves interactive docs at `/docs`.
+FastAPI also serves interactive docs at `/docs` (the Swagger UI assets are loaded from a CDN, so that page needs internet access; the app itself does not).
 
 <details>
 <summary>Configuration reference (environment variables)</summary>
