@@ -22,7 +22,7 @@
 
 <p align="center"><sub>Real run on a laptop CPU with the <code>tiny</code> model: an 11-second clip, language auto-detected, <code>.txt</code> and <code>.srt</code> ready in about a second.</sub></p>
 
-## ✨ Features
+## Features
 
 - **Background jobs with live progress.** An upload returns `202 Accepted` with a job id at once; a worker pool extracts audio with `ffmpeg` and transcribes it with `faster-whisper`, while the browser follows the job over Server-Sent Events (heartbeats included) and falls back to polling.
 - **Two profiles, three languages.** "Faster" (`tiny`, greedy decoding) or "More accurate" (`medium`, beam search 5 + VAD); Polish, English or automatic language detection with the detected language and its probability in the result.
@@ -34,7 +34,7 @@
   <img src="docs/screenshot.png" width="760" alt="Finished job, download buttons and job history with a cache hit">
 </p>
 
-## 🧭 Architecture
+## Architecture
 
 ```mermaid
 flowchart LR
@@ -49,7 +49,7 @@ flowchart LR
 
 Everything runs in one process: the API thread handles uploads and SSE, a bounded thread pool runs the CPU-heavy work, and loaded Whisper models are cached per profile so only the first job pays the load time.
 
-## 🛠 Tech stack
+## Tech stack
 
 | Layer | Used |
 |---|---|
@@ -59,7 +59,7 @@ Everything runs in one process: the API thread handles uploads and SSE, a bounde
 | UI | Jinja2, vanilla JavaScript + CSS (light/dark) |
 | Quality | pytest + HTTPX, GitHub Actions |
 
-## 🚀 Quick start
+## Quick start
 
 Requires Python 3.10+ and `ffmpeg` on the `PATH` (`sudo apt-get install ffmpeg` or `brew install ffmpeg`).
 
@@ -133,7 +133,7 @@ export WHISPER_DEVICE=cuda WHISPER_COMPUTE_TYPE=float16 WHISPER_FAST_MODEL=tiny 
 
 </details>
 
-## 🧪 Tests
+## Tests
 
 ```bash
 pip install -r requirements.txt -r requirements-dev.txt
@@ -142,20 +142,20 @@ pytest -q
 
 13 tests run against the ASGI app in-process with HTTPX. 8 API smoke tests cover the home page, the `/health` shape, job listing, 404s for unknown jobs, rejection of invalid uploads and `language=auto`; 5 job-flow tests replace ffmpeg and Whisper with fakes and cover a full job with `.txt`/`.srt` downloads and SSE events, a transcript cache hit, a failed transcription, an upload with the wrong container and the SRT helpers. They don't download a model, so they run in about a second. CI runs them on Python 3.10 and 3.12 for every push and pull request, and CodeQL scans the Python code and the page script.
 
-## 🧱 Key technical decisions
+## Key technical decisions
 
 - **Thread pool instead of Celery/Redis.** Whisper inference releases the GIL inside CTranslate2, so threads give real parallelism and the app stays a single `uvicorn` process with no broker. The cost: jobs don't survive a restart (they are marked as interrupted) and work can't be spread over several machines.
 - **SSE with a polling fallback instead of WebSockets.** Progress only flows server to client, SSE works over plain HTTP and through most proxies, and heartbeats keep long jobs from being cut by idle timeouts. If the stream drops, the UI polls `GET /api/jobs/{id}`.
 - **Content-addressed cache.** The SHA-256 is computed while the upload is streamed to disk, so hashing costs no extra pass. The cache key also includes language, profile, output format, model, device and compute type, so changing any of them can't return a stale transcript.
 - **SQLite for jobs and cache.** One file, WAL mode, no extra service, and history plus ETA statistics come from plain SQL. It fits a single-node tool; several app instances would need Postgres or similar.
 
-## 🚧 Limitations and next steps
+## Limitations and next steps
 
 - Single node only: the queue and loaded models live in one process.
 - Cancellation is cooperative and takes effect between Whisper segments, not mid-segment.
 - No authentication; it is meant for local or trusted-network use.
 - The test suite covers the HTTP layer; the transcription pipeline (ffmpeg + model) is not exercised in CI.
 
-## 📄 Licence
+## Licence
 
 MIT, see [LICENSE](LICENSE). Third-party components added to this repository are listed in [3rdparty_licenses.md](3rdparty_licenses.md).
