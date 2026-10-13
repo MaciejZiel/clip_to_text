@@ -71,7 +71,7 @@ Open <http://127.0.0.1:8000>. On first start the `tiny` model (about 75 MB) is d
 | `POST` | `/api/transcribe` | Synchronous one-shot mode, no job history |
 | `GET` | `/health` | Health and runtime metrics (queue, cache, ffmpeg availability) |
 
-FastAPI also serves interactive docs at `/docs`.
+FastAPI also serves interactive docs at `/docs` (the Swagger UI assets are loaded from a CDN, so that page needs internet access; the app itself does not).
 
 <details>
 <summary>Configuration reference (environment variables)</summary>
@@ -122,7 +122,7 @@ pip install -r requirements.txt -r requirements-dev.txt
 pytest -q
 ```
 
-13 tests run against the ASGI app in-process with HTTPX. 8 API smoke tests cover the home page, the `/health` shape, job listing, 404s for unknown jobs, rejection of invalid uploads and `language=auto`; 5 job-flow tests replace ffmpeg and Whisper with fakes and cover a full job with `.txt`/`.srt` downloads and SSE events, a transcript cache hit, a failed transcription and the SRT helpers. They don't download a model, so they run in about a second. CI runs them on Python 3.10 and 3.12 for every push and pull request, and CodeQL scans the Python code and the page script.
+13 tests run against the ASGI app in-process with HTTPX. 8 API smoke tests cover the home page, the `/health` shape, job listing, 404s for unknown jobs, rejection of invalid uploads and `language=auto`; 5 job-flow tests replace ffmpeg and Whisper with fakes and cover a full job with `.txt`/`.srt` downloads and SSE events, a transcript cache hit, a failed transcription, an upload with the wrong container and the SRT helpers. They don't download a model, so they run in about a second. CI runs them on Python 3.10 and 3.12 for every push and pull request, and CodeQL scans the Python code and the page script.
 
 ## Key technical decisions
 
