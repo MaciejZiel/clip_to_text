@@ -7,6 +7,7 @@
 | https://github.com/actions/setup-python | actions/setup-python v7.0.0 (CI only) | MIT | https://github.com/actions/setup-python/blob/main/LICENSE |
 | https://github.com/github/codeql-action | github/codeql-action v4.38.2 (CI only) | MIT | https://github.com/github/codeql-action/blob/main/LICENSE |
 | https://github.com/fastapi/fastapi | fastapi 0.141.1 | MIT | https://github.com/fastapi/fastapi/blob/master/LICENSE |
+| https://github.com/Kludex/uvicorn | uvicorn 0.54.0 | BSD-3-Clause | https://github.com/Kludex/uvicorn/blob/main/LICENSE.md |
 | https://github.com/encode/httpx | httpx 0.28.1 | BSD-3-Clause | https://github.com/encode/httpx/blob/master/LICENSE.md |
 | https://github.com/pytest-dev/pytest | pytest 9.1.1 | MIT | https://github.com/pytest-dev/pytest/blob/main/LICENSE |
 | https://github.com/SYSTRAN/faster-whisper | faster-whisper 1.2.1 | MIT | https://github.com/SYSTRAN/faster-whisper/blob/master/LICENSE |
